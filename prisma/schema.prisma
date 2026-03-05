@@ -1,0 +1,40 @@
+prismagenerator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id          String   @id @default(uuid())
+  name        String
+  phone       String?
+  status      String   @default("disconnected")
+  createdAt   DateTime @default(now())
+  groups      Group[]
+}
+
+model Group {
+  id          String   @id @default(uuid())
+  waId        String
+  name        String
+  accountId   String
+  account     Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@unique([waId, accountId])
+}
+
+model Broadcast {
+  id          String   @id @default(uuid())
+  name        String
+  text        String
+  mediaUrl    String?
+  status      String   @default("draft")
+  sent        Int      @default(0)
+  failed      Int      @default(0)
+  total       Int      @default(0)
+  createdAt   DateTime @default(now())
+}
