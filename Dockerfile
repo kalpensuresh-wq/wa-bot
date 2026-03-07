@@ -24,23 +24,22 @@ RUN apt-get update && apt-get install -y \
 
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV NODE_ENV=production
 
 WORKDIR /app
 
 COPY package.json ./
-COPY prisma ./prisma/
 
 RUN npm install
-
-RUN npx prisma generate
 
 COPY . .
 
 RUN npm run build
 
-RUN mkdir -p /app/wa-sessions /app/media && chmod -R 777 /app/wa-sessions /app/media
+RUN mkdir -p /app/wa-sessions && chmod -R 777 /app/wa-sessions
 
 ENV PORT=3000
+
 EXPOSE 3000
 
-CMD npx prisma migrate deploy && npm run start:prod
+CMD npm run start:prod
