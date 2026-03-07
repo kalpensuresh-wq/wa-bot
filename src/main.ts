@@ -11,18 +11,79 @@ const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
   .map(id => parseInt(id.trim()))
   .filter(id => !isNaN(id));
 
-// Хранилище WhatsApp клиентов (в памяти)
-const waClients = new Map<string, { client: Client; status: string; name: string }>();
-const userStates = new Map<number, { action: string }>();
+// Хранилище аккаунтов с настройками
+// Структура: { id: { client, status, phone, name, customMessage } }
+const waAccounts = new Map<string, {
+  client: Client;
+  status: 'disconnected' | 'connecting' | 'connected' | 'waiting_code';
+  phone?: string;
+  name: string;
+  customMessage: string;
+  pairingCode?: string;
+}>();
+
+const userStates = new Map<number, { action: string; accountId?: string }>();
 const activeBroadcasts = new Map<string, { stop: boolean; sent: number; failed: number; total: number }>();
 
 const isAdmin = (userId: number) => ADMIN_IDS.includes(userId);
 
+// Главное меню
 const mainMenu = () => Markup.inlineKeyboard([
   [Markup.button.callback('📱 Аккаунты', 'accounts')],
-  [Markup.button.callback('📋 Мои группы', 'groups')],
-  [Markup.button.callback('📨 Рассылка', 'broadcast')],
+  [Markup.button.callback('📨 Рассылка', 'broadcast_menu')],
 ]);
+
+// Меню аккаунтов
+const accountsMenu = (accountId?: string) => {
+  const buttons: any[][] = [];
+
+  if (accountId) {
+    // Кнопки для конкретного аккаунта
+    const acc = waAccounts.get(accountId);
+    if (acc) {
+      if (acc.status === 'connected') {
+        buttons.push([Markup.button.callback('📝 Изменить текст', `edit_msg_${accountId}`)]);
+        buttons.push([Markup.button.callback('📋 Смотреть чаты', `view_chats_${accountId}`)]);
+      }
+      buttons.push([Markup.button.callback('❌ Отвязать номер', `unbind_${accountId}`)]);
+    }
+    buttons.push([Markup.button.callback('◀️ Назад к списку', 'accounts')]);
+  } else {
+    // Список всех аккаунтов
+    if (waAccounts.size > 0) {
+      waAccounts.forEach((acc, id) => {
+        const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'waiting_code' ? '⏳' : '🔴';
+        buttons.push([Markup.button.callback(`${emoji} ${acc.name || acc.phone || id}`, `acc_${id}`)]);
+      });
+    }
+    buttons.push([Markup.button.callback('➕ Добавить номер', 'add_account')]);
+    buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
+  }
+
+  return Markup.inlineKeyboard(buttons);
+};
+
+// Меню выбора аккаунта для рассылки
+const broadcastSelectMenu = () => {
+  const buttons: any[][] = [];
+
+  // Показываем только подключенные аккаунты
+  waAccounts.forEach((acc, id) => {
+    if (acc.status === 'connected') {
+      const msgPreview = acc.customMessage ? acc.customMessage.substring(0, 30) + '...' : 'Текст не задан';
+      buttons.push([
+        Markup.button.callback(`📱 ${acc.name || acc.phone}`, `broadcast_acc_${id}`)
+      ]);
+    }
+  });
+
+  if (buttons.length === 0) {
+    buttons.push([Markup.button.callback('❌ Нет подключенных аккаунтов', 'main')]);
+  }
+
+  buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
+  return Markup.inlineKeyboard(buttons);
+};
 
 // Middleware
 bot.use(async (ctx, next) => {
@@ -50,266 +111,284 @@ bot.action('main', async (ctx) => {
   }).catch(() => {});
 });
 
+// === УПРАВЛЕНИЕ АККАУНТАМИ ===
+
 // Список аккаунтов
 bot.action('accounts', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 
-  let text = '📱 *Аккаунты WhatsApp*\n\n';
+  let text = '📱 *Мои аккаунты*\n\n';
 
-  if (waClients.size === 0) {
-    text += 'Нет подключенных аккаунтов\n';
+  if (waAccounts.size === 0) {
+    text += 'Нет добавленных аккаунтов\n';
   } else {
-    waClients.forEach((wa, id) => {
-      const emoji = wa.status === 'connected' ? '🟢' : wa.status === 'qr' ? '📱' : '🔴';
-      text += `${emoji} *${wa.name}* (${wa.status})\n\n`;
+    waAccounts.forEach((acc, id) => {
+      const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'waiting_code' ? '⏳' : acc.status === 'connecting' ? '🔄' : '🔴';
+      text += `${emoji} *${acc.name || acc.phone || id}*\n`;
+      if (acc.phone) text += `   📞 ${acc.phone}\n`;
+      if (acc.customMessage) {
+        text += `   📝 ${acc.customMessage.substring(0, 40)}...\n`;
+      }
+      text += '\n';
     });
   }
-
-  const buttons: any[][] = [];
-  buttons.push([Markup.button.callback('➕ Добавить аккаунт', 'add_account')]);
-  buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
 
   await ctx.editMessageText(text, {
     parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard(buttons)
+    ...accountsMenu()
   }).catch(() => {});
 });
 
-// Добавить аккаунт
-bot.action('add_account', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  userStates.set(ctx.from!.id, { action: 'waiting_account_name' });
-  await ctx.editMessageText('📱 Введите название для нового аккаунта:', {
-    ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'accounts')]])
-  }).catch(() => {});
-});
-
-// Подключить аккаунт (создать новый клиент)
-bot.action(/^connect_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Подключение...').catch(() => {});
-  try {
-    const accountId = ctx.match![1];
-    await ctx.editMessageText('⏳ Запуск WhatsApp клиента...\nЭто может занять 10-30 секунд').catch(() => {});
-
-    const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
-    if (!fs.existsSync(sessionsPath)) {
-      fs.mkdirSync(sessionsPath, { recursive: true });
-    }
-
-    const client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: accountId,
-        dataPath: sessionsPath,
-      }),
-      puppeteer: {
-        headless: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process',
-          '--disable-gpu',
-        ],
-      },
-    });
-
-    const accountName = waClients.get(accountId)?.name || accountId;
-    waClients.set(accountId, { client, status: 'connecting', name: accountName });
-
-    client.on('qr', async (qr) => {
-      console.log('QR received for', accountId);
-      const waClient = waClients.get(accountId);
-      if (waClient) {
-        waClient.status = 'qr';
-      }
-      try {
-        const qrDataUrl = await QRCode.toDataURL(qr);
-        const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-        const buffer = Buffer.from(base64Data, 'base64');
-        await ctx.replyWithPhoto({ source: buffer }, {
-          caption: '📱 *Отсканируйте QR-код*\n\nWhatsApp → Настройки → Связанные устройства → Привязать устройство',
-          parse_mode: 'Markdown'
-        });
-      } catch (e) {
-        console.error('QR send error:', e);
-      }
-    });
-
-    client.on('ready', async () => {
-      console.log('Client ready for', accountId);
-      const waClient = waClients.get(accountId);
-      if (waClient) {
-        waClient.status = 'connected';
-      }
-      await ctx.reply(`✅ *${accountName}* подключен!\nТелефон: ${client.info?.wid?.user}`).catch(() => {});
-    });
-
-    client.on('auth_failure', async () => {
-      console.log('Auth failure for', accountId);
-      const waClient = waClients.get(accountId);
-      if (waClient) waClient.status = 'disconnected';
-      await ctx.reply('❌ Ошибка авторизации').catch(() => {});
-    });
-
-    client.on('disconnected', async () => {
-      console.log('Disconnected:', accountId);
-      const waClient = waClients.get(accountId);
-      if (waClient) waClient.status = 'disconnected';
-      await ctx.reply(`⚠️ Аккаунт *${accountName}* отключен`).catch(() => {});
-    });
-
-    await client.initialize();
-  } catch (error) {
-    console.error('Connect error:', error);
-    await ctx.editMessageText(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
-  }
-});
-
-// Отключить аккаунт
-bot.action(/^disconnect_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  try {
-    const accountId = ctx.match![1];
-    const waClient = waClients.get(accountId);
-    if (waClient) {
-      try { await waClient.client.destroy(); } catch (e) {}
-      waClients.delete(accountId);
-    }
-    await ctx.reply('✅ Аккаунт отключен').catch(() => {});
-  } catch (error) {
-    console.error('Error in disconnect:', error);
-    await ctx.reply('❌ Ошибка').catch(() => {});
-  }
-});
-
-// Удалить аккаунт
-bot.action(/^delete_(.+)$/, async (ctx) => {
+// Просмотр конкретного аккаунта
+bot.action(/^acc_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const accountId = ctx.match![1];
-  await ctx.editMessageText('⚠️ Удалить этот аккаунт?', {
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Да', `confirm_del_${accountId}`)],
-      [Markup.button.callback('❌ Нет', 'accounts')]
-    ])
-  }).catch(() => {});
-});
+  const acc = waAccounts.get(accountId);
 
-bot.action(/^confirm_del_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  try {
-    const accountId = ctx.match![1];
-    const waClient = waClients.get(accountId);
-    if (waClient) {
-      try { await waClient.client.destroy(); } catch (e) {}
-      waClients.delete(accountId);
-    }
-    await ctx.reply('✅ Аккаунт удален').catch(() => {});
-  } catch (error) {
-    console.error('Error in confirm_del:', error);
-    await ctx.reply('❌ Ошибка').catch(() => {});
-  }
-});
-
-// Мои группы (из памяти)
-bot.action('groups', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-
-  let text = '📋 *Архивные группы*\n\n';
-  let totalGroups = 0;
-
-  for (const [id, wa] of waClients) {
-    if (wa.status !== 'connected') continue;
-
-    try {
-      const chats = await wa.client.getChats();
-      const archivedGroups = chats.filter((chat: any) => chat.isGroup && chat.archived);
-      totalGroups += archivedGroups.length;
-
-      if (archivedGroups.length > 0) {
-        text += `📱 *${wa.name}:* ${archivedGroups.length} групп\n`;
-      }
-    } catch (error) {
-      console.error('Error getting chats:', error);
-    }
-  }
-
-  if (totalGroups === 0) {
-    text += 'Нет архивных групп.\n';
-    text += 'Подключите аккаунт и убедитесь, что есть архивные группы в WhatsApp.';
-  } else {
-    text += `\n📊 Всего: ${totalGroups} групп`;
-  }
-
-  await ctx.editMessageText(text, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Назад', 'main')]])
-  }).catch(() => {});
-});
-
-// Рассылка
-bot.action('broadcast', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-
-  // Проверяем есть ли подключенные аккаунты
-  let connectedCount = 0;
-  for (const [id, wa] of waClients) {
-    if (wa.status === 'connected') connectedCount++;
-  }
-
-  if (connectedCount === 0) {
-    await ctx.editMessageText('❌ Нет подключенных аккаунтов.\nСначала добавьте аккаунт в разделе "Аккаунты".', {
-      ...Markup.inlineKeyboard([[Markup.button.callback('◀️ Назад', 'main')]])
+  if (!acc) {
+    await ctx.editMessageText('❌ Аккаунт не найден', {
+      ...accountsMenu()
     }).catch(() => {});
     return;
   }
 
-  userStates.set(ctx.from!.id, { action: 'waiting_broadcast_text' });
-  await ctx.editMessageText('📨 *Рассылка*\n\nОтправьте текст или видео для рассылки во ВСЕ архивные группы:', {
+  let text = `📱 *${acc.name || acc.phone || accountId}*\n\n`;
+  text += `📊 Статус: ${acc.status}\n`;
+  if (acc.phone) text += `📞 Телефон: ${acc.phone}\n`;
+  if (acc.customMessage) {
+    text += `\n📝 *Текст рассылки:*\n${acc.customMessage}\n`;
+  } else {
+    text += `\n📝 Текст не задан\n`;
+  }
+
+  await ctx.editMessageText(text, {
     parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'main')]])
+    ...accountsMenu(accountId)
   }).catch(() => {});
 });
 
-// Остановка рассылки
-bot.action(/^stop_broadcast_(.+)$/, async (ctx) => {
+// Добавить аккаунт - ввод номера
+bot.action('add_account', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const broadcastId = ctx.match![1];
-  const broadcast = activeBroadcasts.get(broadcastId);
-  if (broadcast) {
-    broadcast.stop = true;
-    await ctx.editMessageText('⏹ Рассылка остановлена').catch(() => {});
-  }
+  userStates.set(ctx.from!.id, { action: 'waiting_phone' });
+  await ctx.editMessageText(
+    '📱 *Добавление номера*\n\n' +
+    'Введите номер телефона в формате:\n' +
+    '+79991234567 (без пробелов)\n\n' +
+    'После этого бот выдаст код для привязки.',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'accounts')]])
+    }
+  ).catch(() => {});
 });
 
-// Обработка текстовых сообщений
+// Отвязать аккаунт
+bot.action(/^unbind_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+
+  await ctx.editMessageText(
+    `⚠️ *Отвязать номер?*\n\n` +
+    `Аккаунт будет удален и отключен от WhatsApp.`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('✅ Да, отвязать', `confirm_unbind_${accountId}`)],
+          [Markup.button.callback('❌ Отмена', `acc_${accountId}`)]
+        ]
+      }
+    }
+  ).catch(() => {});
+});
+
+bot.action(/^confirm_unbind_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  const acc = waAccounts.get(accountId);
+
+  if (acc && acc.client) {
+    try {
+      await acc.client.logout();
+      await acc.client.destroy();
+    } catch (e) {
+      console.error('Error destroying client:', e);
+    }
+  }
+
+  // Удаляем сессию
+  const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
+  const sessionDir = `${sessionsPath}/${accountId}`;
+  if (fs.existsSync(sessionDir)) {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+
+  waAccounts.delete(accountId);
+
+  await ctx.reply('✅ Аккаунт отвязан').catch(() => {});
+  await ctx.editMessageText('✅ Аккаунт удален', {
+    ...accountsMenu()
+  }).catch(() => {});
+});
+
+// Изменить текст рассылки
+bot.action(/^edit_msg_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  userStates.set(ctx.from!.id, { action: 'waiting_custom_message', accountId });
+
+  const acc = waAccounts.get(accountId);
+  const currentMsg = acc?.customMessage || '';
+
+  await ctx.editMessageText(
+    `📝 *Текст для аккаунта ${acc?.name || acc?.phone || accountId}*\n\n` +
+    `Текущий текст: ${currentMsg || 'не задан'}\n\n` +
+    `Введите новый текст для рассылки:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', `acc_${accountId}`)]])
+    }
+  ).catch(() => {});
+});
+
+// === РАССЫЛКА ===
+
+// Меню выбора аккаунта для рассылки
+bot.action('broadcast_menu', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+
+  let text = '📨 *Рассылка*\n\n';
+  text += 'Выберите аккаунт для рассылки:\n\n';
+
+  let hasConnected = false;
+  waAccounts.forEach((acc, id) => {
+    if (acc.status === 'connected') {
+      hasConnected = true;
+      const msg = acc.customMessage ? `"${acc.customMessage.substring(0, 25)}..."` : '❌ текст не задан';
+      text += `📱 ${acc.name || acc.phone}\n`;
+      text += `   ${msg}\n\n`;
+    }
+  });
+
+  if (!hasConnected) {
+    text += '❌ Нет подключенных аккаунтов';
+  }
+
+  await ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    ...broadcastSelectMenu()
+  }).catch(() => {});
+});
+
+// Выбрали аккаунт для рассылки
+bot.action(/^broadcast_acc_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  const acc = waAccounts.get(accountId);
+
+  if (!acc || acc.status !== 'connected') {
+    await ctx.editMessageText('❌ Аккаунт не подключен', {
+      ...broadcastSelectMenu()
+    }).catch(() => {});
+    return;
+  }
+
+  if (!acc.customMessage) {
+    // Если текст не задан - просим ввести
+    userStates.set(ctx.from!.id, { action: 'waiting_broadcast_text', accountId });
+    await ctx.editMessageText(
+      `📨 *Рассылка с ${acc.name || acc.phone}*\n\n` +
+      `⚠️ Текст не настроен!\n\n` +
+      `Введите текст для рассылки:`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'broadcast_menu')]])
+      }
+    ).catch(() => {});
+    return;
+  }
+
+  // Показываем подтверждение
+  await ctx.editMessageText(
+    `📨 *Подтверждение рассылки*\n\n` +
+    `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
+    `📝 *Текст:*\n${acc.customMessage}\n\n` +
+    `⚠️ Отправить во все архивные группы?\nЗадержка: 10 минут между сообщениями.`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('✅ Да, начать', `confirm_broadcast_${accountId}`)],
+          [Markup.button.callback('❌ Отмена', 'broadcast_menu')]
+        ]
+      }
+    }
+  ).catch(() => {});
+});
+
+// Подтверждение рассылки
+bot.action(/^confirm_broadcast_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  const acc = waAccounts.get(accountId);
+
+  if (!acc || acc.status !== 'connected' || !acc.customMessage) {
+    await ctx.reply('❌ Аккаунт не готов к рассылке').catch(() => {});
+    return;
+  }
+
+  await startBroadcast(ctx, accountId, acc.customMessage);
+});
+
+// === ОБРАБОТЧИКИ СООБЩЕНИЙ ===
+
 bot.on('text', async (ctx) => {
   if (!isAdmin(ctx.from!.id)) return;
   const state = userStates.get(ctx.from!.id);
   if (!state) return;
 
   try {
-    if (state.action === 'waiting_account_name') {
-      const name = ctx.message.text;
-      const accountId = `wa_${Date.now()}`;
-      waClients.set(accountId, { client: null as any, status: 'pending', name });
-      userStates.delete(ctx.from!.id);
+    // Ввод номера телефона
+    if (state.action === 'waiting_phone') {
+      const phone = ctx.message.text.trim();
+      // Валидация номера
+      const cleanPhone = phone.replace(/[^0-9+]/g, '');
+      if (cleanPhone.length < 10) {
+        await ctx.reply('❌ Неверный формат номера. Введите в формате +79991234567');
+        return;
+      }
 
-      // Сразу предлагаем подключить
-      await ctx.reply(`✅ Аккаунт "${name}" создан.\nНажмите кнопку ниже для подключения:`, {
-        reply_markup: {
-          inline_keyboard: [[Markup.button.callback('🔗 Подключить WhatsApp', `connect_${accountId}`)]]
-        }
-      });
+      await addNewAccount(ctx, cleanPhone);
+      userStates.delete(ctx.from!.id);
       return;
     }
 
+    // Ввод текста для аккаунта
+    if (state.action === 'waiting_custom_message') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      if (acc) {
+        acc.customMessage = ctx.message.text;
+        await ctx.reply(`✅ Текст сохранен для аккаунта ${acc.name || acc.phone}`);
+        await ctx.editMessageText(
+          `✅ Текст сохранен!\n\n📝 ${ctx.message.text}`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      }
+      userStates.delete(ctx.from!.id);
+      return;
+    }
+
+    // Ввод текста для рассылки (если не настроен)
     if (state.action === 'waiting_broadcast_text') {
-      const text = ctx.message.text;
-      await startArchivedBroadcast(ctx, text);
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      if (acc) {
+        // Сохраняем как текст по умолчанию для этого аккаунта
+        acc.customMessage = ctx.message.text;
+        await ctx.reply('✅ Текст сохранен. Нажмите "Да, начать" для рассылки.');
+      }
       userStates.delete(ctx.from!.id);
       return;
     }
@@ -320,130 +399,227 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// Обработка видео
-bot.on('video', async (ctx) => {
-  if (!isAdmin(ctx.from!.id)) return;
-  const state = userStates.get(ctx.from!.id);
+// === ФУНКЦИИ ===
 
-  try {
-    if (state?.action === 'waiting_broadcast_text') {
-      const caption = ctx.message.caption || '';
-      await startArchivedBroadcast(ctx, caption);
-      userStates.delete(ctx.from!.id);
-    }
-  } catch (error) {
-    console.error('Error in video handler:', error);
-    await ctx.reply('❌ Ошибка').catch(() => {});
-    userStates.delete(ctx.from!.id);
+// Добавить новый аккаунт с кодом подтверждения
+async function addNewAccount(ctx: any, phone: string) {
+  const accountId = `wa_${Date.now()}`;
+
+  await ctx.reply('⏳ Создание сессии...').catch(() => {});
+
+  const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
+  if (!fs.existsSync(sessionsPath)) {
+    fs.mkdirSync(sessionsPath, { recursive: true });
   }
-});
 
-// Функция рассылки во ВСЕ архивные чаты с задержкой 10 минут
-async function startArchivedBroadcast(ctx: any, text: string) {
-  const connectedAccounts: { accountId: string; client: Client; name: string }[] = [];
+  const client = new Client({
+    authStrategy: new LocalAuth({
+      clientId: accountId,
+      dataPath: sessionsPath,
+    }),
+    puppeteer: {
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu',
+      ],
+    },
+  });
 
-  waClients.forEach((wa, accountId) => {
-    if (wa.status === 'connected') {
-      connectedAccounts.push({ accountId, client: wa.client, name: wa.name });
+  // Добавляем в хранилище
+  waAccounts.set(accountId, {
+    client,
+    status: 'connecting',
+    phone,
+    name: phone,
+    customMessage: '',
+  });
+
+  let codeSent = false;
+
+  client.on('qr', async (qr) => {
+    console.log('QR received for', accountId);
+    // Если уже есть код подтверждения - не показываем QR
+    const acc = waAccounts.get(accountId);
+    if (acc?.pairingCode) return;
+
+    // Показываем QR только если нет pairing кода
+    try {
+      const qrDataUrl = await QRCode.toDataURL(qr);
+      const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
+      const buffer = Buffer.from(base64Data, 'base64');
+      await ctx.replyWithPhoto({ source: buffer }, {
+        caption: '📱 Сканируйте QR-код\nили введите /start для получения кода подтверждения',
+        parse_mode: 'Markdown'
+      });
+    } catch (e) {
+      console.error('QR send error:', e);
     }
   });
 
-  if (connectedAccounts.length === 0) {
-    return ctx.reply('❌ Нет подключенных аккаунтов').catch(() => {});
+  client.on('ready', async () => {
+    console.log('Client ready for', accountId);
+    const acc = waAccounts.get(accountId);
+    if (acc) {
+      acc.status = 'connected';
+      acc.pairingCode = undefined;
+    }
+    await ctx.reply(
+      `✅ *Подключено!*\n\n` +
+      `📞 Телефон: ${phone}\n\n` +
+      `Теперь настройте текст для рассылки в разделе "Аккаунты"`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  });
+
+  client.on('auth_failure', async (msg) => {
+    console.log('Auth failure for', accountId, msg);
+    const acc = waAccounts.get(accountId);
+    if (acc) acc.status = 'disconnected';
+    await ctx.reply(`❌ Ошибка авторизации: ${msg}`).catch(() => {});
+  });
+
+  client.on('disconnected', async () => {
+    console.log('Disconnected:', accountId);
+    const acc = waAccounts.get(accountId);
+    if (acc) acc.status = 'disconnected';
+  });
+
+  try {
+    await client.initialize();
+
+    // Пробуем запросить код подтверждения
+    try {
+      // Подождем немного чтобы клиент инициализировался
+      await new Promise(r => setTimeout(r, 3000));
+
+      // Пробуем получить код подтверждения
+      const pairingCode = await (client as any).requestPairingCode(phone);
+      const formattedCode = pairingCode.replace(/(\d{4})(\d{4})/g, '$1 $2');
+
+      const acc = waAccounts.get(accountId);
+      if (acc) {
+        acc.pairingCode = pairingCode;
+        acc.status = 'waiting_code';
+      }
+
+      await ctx.reply(
+        `🔐 *Код для привязки*\n\n` +
+        `Введите этот код в WhatsApp:\n` +
+        `*${formattedCode}*\n\n` +
+        `WhatsApp → Настройки → Связанные устройства → Привязать по номеру`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+
+      console.log('Pairing code sent:', formattedCode);
+    } catch (codeError) {
+      console.log('Pairing code not available, using QR:', codeError);
+      // Если код не работает - используем QR
+      await ctx.reply(
+        `📱 Используйте QR-код для подключения\n` +
+        `или перезапустите бота и попробуйте снова`
+      ).catch(() => {});
+    }
+
+  } catch (error) {
+    console.error('Initialize error:', error);
+    const acc = waAccounts.get(accountId);
+    if (acc) acc.status = 'disconnected';
+    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
+  }
+}
+
+// Рассылка
+async function startBroadcast(ctx: any, accountId: string, text: string) {
+  const acc = waAccounts.get(accountId);
+
+  if (!acc || acc.status !== 'connected') {
+    return ctx.reply('❌ Аккаунт не подключен').catch(() => {});
   }
 
-  let allArchivedChats: any[] = [];
   await ctx.reply('🔍 Поиск архивных чатов...').catch(() => {});
 
-  for (const acc of connectedAccounts) {
-    try {
-      const chats = await acc.client.getChats();
-      const archivedChats = chats.filter((chat: any) => chat.isGroup && chat.archived);
-      allArchivedChats = [...allArchivedChats, ...archivedChats.map((chat: any) => ({
-        ...chat,
-        accountId: acc.accountId,
-        accountName: acc.name
-      }))];
-      await ctx.reply(`📱 *${acc.name}:* найдено ${archivedChats.length} архивных групп`, { parse_mode: 'Markdown' }).catch(() => {});
-    } catch (error) {
-      console.error('Error getting chats:', error);
-    }
-  }
+  try {
+    const chats = await acc.client.getChats();
+    const archivedChats = chats.filter((chat: any) => chat.isGroup && chat.archived);
 
-  if (allArchivedChats.length === 0) {
-    return ctx.reply('❌ Архивные чаты не найдены').catch(() => {});
-  }
-
-  const broadcastId = Date.now().toString();
-  activeBroadcasts.set(broadcastId, { stop: false, sent: 0, failed: 0, total: allArchivedChats.length });
-
-  const estimatedMin = allArchivedChats.length * 10;
-  const hours = Math.floor(estimatedMin / 60);
-  const mins = estimatedMin % 60;
-
-  await ctx.reply(
-    `📦 *Рассылка в архивные чаты*\n\n` +
-    `Найдено: ${allArchivedChats.length} чатов\n` +
-    `Время: ~${hours}ч ${mins}мин\n` +
-    `Задержка: 10 минут между сообщениями\n\n` +
-    `Нажмите /start для остановки`,
-    { parse_mode: 'Markdown' }
-  );
-
-  let sent = 0, failed = 0;
-
-  for (let i = 0; i < allArchivedChats.length; i++) {
-    const broadcast = activeBroadcasts.get(broadcastId);
-    if (broadcast?.stop) {
-      await ctx.reply(`⏹ Остановлено\n✅ ${sent} | ❌ ${failed}`).catch(() => {});
-      activeBroadcasts.delete(broadcastId);
-      return;
+    if (archivedChats.length === 0) {
+      return ctx.reply('❌ Архивные группы не найдены').catch(() => {});
     }
 
-    const chat = allArchivedChats[i];
-    const wa = waClients.get(chat.accountId);
+    const broadcastId = Date.now().toString();
+    activeBroadcasts.set(broadcastId, { stop: false, sent: 0, failed: 0, total: archivedChats.length });
 
-    if (!wa || wa.status !== 'connected') {
-      failed++;
-      continue;
-    }
+    const estimatedMin = archivedChats.length * 10;
+    const hours = Math.floor(estimatedMin / 60);
+    const mins = estimatedMin % 60;
 
-    try {
-      await wa.client.sendMessage(chat.id._serialized, text);
-      sent++;
+    await ctx.reply(
+      `📦 *Рассылка*\n\n` +
+      `📱 Аккаунт: ${acc.name || acc.phone}\n` +
+      `📊 Найдено: ${archivedChats.length} чатов\n` +
+      `⏱ Время: ~${hours}ч ${mins}мин\n\n` +
+      `Нажмите /start для остановки`,
+      { parse_mode: 'Markdown' }
+    );
 
-      console.log(`Sent to ${chat.name} (${i+1}/${allArchivedChats.length})`);
+    let sent = 0, failed = 0;
 
-      // Обновляем каждые 5 сообщений
-      if (i % 5 === 0 || i === allArchivedChats.length - 1) {
-        const remaining = allArchivedChats.length - (i + 1);
-        const remainingTime = remaining * 10;
-        await ctx.reply(
-          `📊 Прогресс: ${i + 1}/${allArchivedChats.length}\n` +
-          `✅ Успешно: ${sent} | ❌ Ошибок: ${failed}\n` +
-          `⏳ Осталось: ~${Math.ceil(remainingTime / 60)} мин`,
-        ).catch(() => {});
+    for (let i = 0; i < archivedChats.length; i++) {
+      const broadcast = activeBroadcasts.get(broadcastId);
+      if (broadcast?.stop) {
+        await ctx.reply(`⏹ Остановлено\n✅ ${sent} | ❌ ${failed}`).catch(() => {});
+        activeBroadcasts.delete(broadcastId);
+        return;
       }
 
-      // Задержка 10 минут между сообщениями
-      if (i < allArchivedChats.length - 1) {
-        await new Promise(r => setTimeout(r, 600000)); // 10 минут
+      const chat = archivedChats[i];
+
+      try {
+        await acc.client.sendMessage(chat.id._serialized, text);
+        sent++;
+        console.log(`Sent to ${chat.name} (${i+1}/${archivedChats.length})`);
+
+        // Обновляем каждые 5 сообщений
+        if (i % 5 === 0 || i === archivedChats.length - 1) {
+          const remaining = archivedChats.length - (i + 1);
+          await ctx.reply(
+            `📊 ${i + 1}/${archivedChats.length}\n` +
+            `✅ ${sent} | ❌ ${failed}\n` +
+            `⏳ ~${Math.ceil(remaining * 10 / 60)} мин`,
+          ).catch(() => {});
+        }
+
+        // Задержка 10 минут
+        if (i < archivedChats.length - 1) {
+          await new Promise(r => setTimeout(r, 600000));
+        }
+      } catch (error) {
+        console.error('Send error:', error);
+        failed++;
       }
-    } catch (error) {
-      console.error('Send error:', error);
-      failed++;
     }
+
+    await ctx.reply(
+      `🏁 *Завершено*\n\n` +
+      `✅ Отправлено: ${sent}\n` +
+      `❌ Ошибок: ${failed}`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+
+    activeBroadcasts.delete(broadcastId);
+
+  } catch (error) {
+    console.error('Broadcast error:', error);
+    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
   }
-
-  await ctx.reply(
-    `🏁 *Рассылка завершена*\n\n` +
-    `✅ Отправлено: ${sent}\n` +
-    `❌ Ошибок: ${failed}\n` +
-    `📊 Всего: ${allArchivedChats.length}`,
-    { parse_mode: 'Markdown' }
-  ).catch(() => {});
-
-  activeBroadcasts.delete(broadcastId);
 }
 
 // Глобальный обработчик ошибок
@@ -460,6 +636,7 @@ bot.catch((err, ctx) => {
 async function main() {
   console.log('🚀 Starting bot...');
   console.log('Admin IDs:', ADMIN_IDS);
+  console.log('Accounts:', waAccounts.size);
 
   await bot.launch();
   console.log('✅ Bot started');
