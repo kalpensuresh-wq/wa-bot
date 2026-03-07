@@ -11,15 +11,13 @@ const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
   .map(id => parseInt(id.trim()))
   .filter(id => !isNaN(id));
 
-// Хранилище аккаунтов с настройками
-// Структура: { id: { client, status, phone, name, customMessage } }
+// Хранилище аккаунтов
 const waAccounts = new Map<string, {
   client: Client;
-  status: 'disconnected' | 'connecting' | 'connected' | 'waiting_code';
+  status: 'disconnected' | 'connecting' | 'connected';
   phone?: string;
   name: string;
   customMessage: string;
-  pairingCode?: string;
 }>();
 
 const userStates = new Map<number, { action: string; accountId?: string }>();
@@ -38,21 +36,18 @@ const accountsMenu = (accountId?: string) => {
   const buttons: any[][] = [];
 
   if (accountId) {
-    // Кнопки для конкретного аккаунта
     const acc = waAccounts.get(accountId);
     if (acc) {
       if (acc.status === 'connected') {
         buttons.push([Markup.button.callback('📝 Изменить текст', `edit_msg_${accountId}`)]);
-        buttons.push([Markup.button.callback('📋 Смотреть чаты', `view_chats_${accountId}`)]);
       }
       buttons.push([Markup.button.callback('❌ Отвязать номер', `unbind_${accountId}`)]);
     }
     buttons.push([Markup.button.callback('◀️ Назад к списку', 'accounts')]);
   } else {
-    // Список всех аккаунтов
     if (waAccounts.size > 0) {
       waAccounts.forEach((acc, id) => {
-        const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'waiting_code' ? '⏳' : '🔴';
+        const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'connecting' ? '🔄' : '🔴';
         buttons.push([Markup.button.callback(`${emoji} ${acc.name || acc.phone || id}`, `acc_${id}`)]);
       });
     }
@@ -67,10 +62,8 @@ const accountsMenu = (accountId?: string) => {
 const broadcastSelectMenu = () => {
   const buttons: any[][] = [];
 
-  // Показываем только подключенные аккаунты
   waAccounts.forEach((acc, id) => {
     if (acc.status === 'connected') {
-      const msgPreview = acc.customMessage ? acc.customMessage.substring(0, 30) + '...' : 'Текст не задан';
       buttons.push([
         Markup.button.callback(`📱 ${acc.name || acc.phone}`, `broadcast_acc_${id}`)
       ]);
@@ -123,7 +116,7 @@ bot.action('accounts', async (ctx) => {
     text += 'Нет добавленных аккаунтов\n';
   } else {
     waAccounts.forEach((acc, id) => {
-      const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'waiting_code' ? '⏳' : acc.status === 'connecting' ? '🔄' : '🔴';
+      const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'connecting' ? '🔄' : '🔴';
       text += `${emoji} *${acc.name || acc.phone || id}*\n`;
       if (acc.phone) text += `   📞 ${acc.phone}\n`;
       if (acc.customMessage) {
@@ -139,7 +132,7 @@ bot.action('accounts', async (ctx) => {
   }).catch(() => {});
 });
 
-// Просмотр конкретного аккаунта
+// Просмотр аккаунта
 bot.action(/^acc_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const accountId = ctx.match![1];
@@ -167,15 +160,16 @@ bot.action(/^acc_(.+)$/, async (ctx) => {
   }).catch(() => {});
 });
 
-// Добавить аккаунт - ввод номера
+// Добавить аккаунт - выбор способа
 bot.action('add_account', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   userStates.set(ctx.from!.id, { action: 'waiting_phone' });
+
   await ctx.editMessageText(
     '📱 *Добавление номера*\n\n' +
     'Введите номер телефона в формате:\n' +
-    '+79991234567 (без пробелов)\n\n' +
-    'После этого бот выдаст код для привязки.',
+    '+79991234567\n\n' +
+    'После ввода номера бот отправит QR-код для сканирования.',
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'accounts')]])
@@ -254,7 +248,6 @@ bot.action(/^edit_msg_(.+)$/, async (ctx) => {
 
 // === РАССЫЛКА ===
 
-// Меню выбора аккаунта для рассылки
 bot.action('broadcast_menu', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 
@@ -295,7 +288,6 @@ bot.action(/^broadcast_acc_(.+)$/, async (ctx) => {
   }
 
   if (!acc.customMessage) {
-    // Если текст не задан - просим ввести
     userStates.set(ctx.from!.id, { action: 'waiting_broadcast_text', accountId });
     await ctx.editMessageText(
       `📨 *Рассылка с ${acc.name || acc.phone}*\n\n` +
@@ -352,7 +344,6 @@ bot.on('text', async (ctx) => {
     // Ввод номера телефона
     if (state.action === 'waiting_phone') {
       const phone = ctx.message.text.trim();
-      // Валидация номера
       const cleanPhone = phone.replace(/[^0-9+]/g, '');
       if (cleanPhone.length < 10) {
         await ctx.reply('❌ Неверный формат номера. Введите в формате +79991234567');
@@ -380,12 +371,11 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    // Ввод текста для рассылки (если не настроен)
+    // Ввод текста для рассылки
     if (state.action === 'waiting_broadcast_text') {
       const accountId = state.accountId;
       const acc = waAccounts.get(accountId!);
       if (acc) {
-        // Сохраняем как текст по умолчанию для этого аккаунта
         acc.customMessage = ctx.message.text;
         await ctx.reply('✅ Текст сохранен. Нажмите "Да, начать" для рассылки.');
       }
@@ -401,11 +391,24 @@ bot.on('text', async (ctx) => {
 
 // === ФУНКЦИИ ===
 
-// Добавить новый аккаунт с кодом подтверждения
+// Добавить новый аккаунт
 async function addNewAccount(ctx: any, phone: string) {
-  const accountId = `wa_${Date.now()}`;
+  const accountId = `wa_${phone.replace(/\+/g, '')}`;
 
-  await ctx.reply('⏳ Создание сессии...').catch(() => {});
+  // Проверяем не добавлен ли уже
+  if (waAccounts.has(accountId)) {
+    const existing = waAccounts.get(accountId);
+    if (existing?.status === 'connected') {
+      await ctx.reply('✅ Этот номер уже подключен!').catch(() => {});
+      return;
+    }
+    // Если был - удаляем старую сессию
+    if (existing?.client) {
+      try { await existing.client.destroy(); } catch (e) {}
+    }
+  }
+
+  await ctx.reply('⏳ Создание сессии...\nЭто может занять 10-30 секунд').catch(() => {});
 
   const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
   if (!fs.existsSync(sessionsPath)) {
@@ -433,7 +436,7 @@ async function addNewAccount(ctx: any, phone: string) {
     },
   });
 
-  // Добавляем в хранилище
+  // Сохраняем в память
   waAccounts.set(accountId, {
     client,
     status: 'connecting',
@@ -442,25 +445,32 @@ async function addNewAccount(ctx: any, phone: string) {
     customMessage: '',
   });
 
-  let codeSent = false;
+  let qrSent = false;
 
   client.on('qr', async (qr) => {
     console.log('QR received for', accountId);
-    // Если уже есть код подтверждения - не показываем QR
-    const acc = waAccounts.get(accountId);
-    if (acc?.pairingCode) return;
 
-    // Показываем QR только если нет pairing кода
-    try {
-      const qrDataUrl = await QRCode.toDataURL(qr);
-      const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-      const buffer = Buffer.from(base64Data, 'base64');
-      await ctx.replyWithPhoto({ source: buffer }, {
-        caption: '📱 Сканируйте QR-код\nили введите /start для получения кода подтверждения',
-        parse_mode: 'Markdown'
-      });
-    } catch (e) {
-      console.error('QR send error:', e);
+    // Если уже подключен - не показываем QR
+    const acc = waAccounts.get(accountId);
+    if (acc?.status === 'connected') return;
+
+    if (!qrSent) {
+      qrSent = true;
+      try {
+        const qrDataUrl = await QRCode.toDataURL(qr);
+        const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
+        const buffer = Buffer.from(base64Data, 'base64');
+        await ctx.replyWithPhoto({ source: buffer }, {
+          caption: '📱 *Отсканируйте QR-код*\n\n' +
+            'WhatsApp → Настройки → Связанные устройства → Привязать устройство\n\n' +
+            '⚠️ Если не сканируется, проверьте:\n' +
+            '1. Интернет на телефоне\n' +
+            '2. Закройте другие сессии WhatsApp Web',
+          parse_mode: 'Markdown'
+        });
+      } catch (e) {
+        console.error('QR send error:', e);
+      }
     }
   });
 
@@ -469,7 +479,6 @@ async function addNewAccount(ctx: any, phone: string) {
     const acc = waAccounts.get(accountId);
     if (acc) {
       acc.status = 'connected';
-      acc.pairingCode = undefined;
     }
     await ctx.reply(
       `✅ *Подключено!*\n\n` +
@@ -483,51 +492,22 @@ async function addNewAccount(ctx: any, phone: string) {
     console.log('Auth failure for', accountId, msg);
     const acc = waAccounts.get(accountId);
     if (acc) acc.status = 'disconnected';
-    await ctx.reply(`❌ Ошибка авторизации: ${msg}`).catch(() => {});
+    await ctx.reply(
+      `❌ Ошибка авторизации\n\n` +
+      `Попробуйте ещё раз: удалите аккаунт и добавьте заново`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
   });
 
   client.on('disconnected', async () => {
     console.log('Disconnected:', accountId);
     const acc = waAccounts.get(accountId);
     if (acc) acc.status = 'disconnected';
+    await ctx.reply(`⚠️ Аккаунт отключился`).catch(() => {});
   });
 
   try {
     await client.initialize();
-
-    // Пробуем запросить код подтверждения
-    try {
-      // Подождем немного чтобы клиент инициализировался
-      await new Promise(r => setTimeout(r, 3000));
-
-      // Пробуем получить код подтверждения
-      const pairingCode = await (client as any).requestPairingCode(phone);
-      const formattedCode = pairingCode.replace(/(\d{4})(\d{4})/g, '$1 $2');
-
-      const acc = waAccounts.get(accountId);
-      if (acc) {
-        acc.pairingCode = pairingCode;
-        acc.status = 'waiting_code';
-      }
-
-      await ctx.reply(
-        `🔐 *Код для привязки*\n\n` +
-        `Введите этот код в WhatsApp:\n` +
-        `*${formattedCode}*\n\n` +
-        `WhatsApp → Настройки → Связанные устройства → Привязать по номеру`,
-        { parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-      console.log('Pairing code sent:', formattedCode);
-    } catch (codeError) {
-      console.log('Pairing code not available, using QR:', codeError);
-      // Если код не работает - используем QR
-      await ctx.reply(
-        `📱 Используйте QR-код для подключения\n` +
-        `или перезапустите бота и попробуйте снова`
-      ).catch(() => {});
-    }
-
   } catch (error) {
     console.error('Initialize error:', error);
     const acc = waAccounts.get(accountId);
@@ -587,7 +567,6 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
         sent++;
         console.log(`Sent to ${chat.name} (${i+1}/${archivedChats.length})`);
 
-        // Обновляем каждые 5 сообщений
         if (i % 5 === 0 || i === archivedChats.length - 1) {
           const remaining = archivedChats.length - (i + 1);
           await ctx.reply(
@@ -597,7 +576,6 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
           ).catch(() => {});
         }
 
-        // Задержка 10 минут
         if (i < archivedChats.length - 1) {
           await new Promise(r => setTimeout(r, 600000));
         }
@@ -636,7 +614,6 @@ bot.catch((err, ctx) => {
 async function main() {
   console.log('🚀 Starting bot...');
   console.log('Admin IDs:', ADMIN_IDS);
-  console.log('Accounts:', waAccounts.size);
 
   await bot.launch();
   console.log('✅ Bot started');
