@@ -602,4 +602,129 @@ async function startArchivedBroadcast(ctx: any, text: string, mediaFileId?: stri
 
   const progressMsg = await ctx.reply(
     `📦 *Рассылка в архивные чаты*\n\n` +
-    `Найдено чатов: ${allArch
+    `Найдено чатов: ${allArchivedChats.length}\n` +
+    `Примерное время: ${estimatedHours}ч ${remainingMinutes}мин\n` +
+    `Задержка между сообщениями: 10 минут\n\n` +
+    `Прогресс: 0/${allArchivedChats.length}\n\n` +
+    `Нажмите кнопку ниже для остановки:`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[Markup.button.callback('⏹ Остановить рассылку', `stop_broadcast_${broadcastId}`)]]
+      }
+    }
+  );
+
+  let sent = 0;
+  let failed = 0;
+
+  for (let i = 0; i < allArchivedChats.length; i++) {
+    const broadcast = activeBroadcasts.get(broadcastId);
+    if (broadcast?.stop) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        progressMsg.message_id,
+        undefined,
+        `⏹ *Рассылка остановлена*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 Осталось: ${allArchivedChats.length - i}`,
+        { parse_mode: 'Markdown' }
+      );
+      activeBroadcasts.delete(broadcastId);
+      return;
+    }
+
+    const chat = allArchivedChats[i];
+    const wa = waClients.get(chat.accountId);
+
+    if (!wa || wa.status !== 'connected') {
+      failed++;
+      continue;
+    }
+
+    try {
+      await wa.client.sendMessage(chat.id._serialized, text);
+      sent++;
+
+      // Обновляем прогресс
+      if (i % 5 === 0 || i === allArchivedChats.length - 1) {
+        try {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            progressMsg.message_id,
+            undefined,
+            `📦 *Рассылка в архивные чаты*\n\n` +
+            `Прогресс: ${i + 1}/${allArchivedChats.length}\n` +
+            `✅ Успешно: ${sent} | ❌ Ошибок: ${failed}\n\n` +
+            `⏳ Ожидание 10 минут до следующего сообщения...`,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [[Markup.button.callback('⏹ Остановить рассылку', `stop_broadcast_${broadcastId}`)]]
+              }
+            }
+          );
+        } catch (e) {}
+      }
+
+      // Задержка 10 минут (600000 мс) между сообщениями
+      // Для последнего сообщения задержка не нужна
+      if (i < allArchivedChats.length - 1) {
+        await new Promise(r => setTimeout(r, 600000)); // 10 минут
+      }
+    } catch (error) {
+      console.error('Send error to archived chat:', error);
+      failed++;
+    }
+  }
+
+  await ctx.telegram.editMessageText(
+    ctx.chat.id,
+    progressMsg.message_id,
+    undefined,
+    `🏁 *Рассылка завершена*\n\n` +
+    `✅ Отправлено: ${sent}\n` +
+    `❌ Ошибок: ${failed}\n` +
+    `📊 Всего обработано: ${allArchivedChats.length}`,
+    { parse_mode: 'Markdown' }
+  );
+
+  activeBroadcasts.delete(broadcastId);
+}
+
+// Глобальный обработчик ошибок для бота
+bot.catch(async (err, ctx) => {
+  console.error('Global bot error:', err);
+  try {
+    await ctx.reply('⚠️ Произошла ошибка при обработке запроса. Попробуйте еще раз.');
+  } catch (e) {
+    console.error('Error sending error message:', e);
+  }
+});
+
+// Запуск
+async function main() {
+  console.log('🚀 Starting bot...');
+
+  // Загружаем аккаунты из базы и восстанавливаем подключения
+  const accounts = await prisma.account.findMany({
+    where: { status: 'connected' }
+  });
+
+  console.log(`Found ${accounts.length} accounts in database`);
+
+  await bot.launch();
+  console.log('✅ Bot started');
+}
+
+main().catch(console.error);
+
+process.once('SIGINT', () => {
+  console.log('SIGINT received, stopping bot...');
+  bot.stop('SIGINT');
+  process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+  console.log('SIGTERM received, stopping bot...');
+  bot.stop('SIGTERM');
+  process.exit(0);
+});
