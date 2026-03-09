@@ -662,3 +662,201 @@ async function addNewAccount(ctx: any, phone: string) {
   } catch (error) {
     console.error('Initialize error:', error);
     const acc = waAccounts.get(accountId);
+    if (acc) acc.status = 'disconnected';
+    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
+  }
+}
+
+// Улучшенная функция отправки сообщения с повторными попытками
+async function sendMessageWithRetry(client: Client, chatId: string, text: string, maxRetries: number = 3): Promise<boolean> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`  Attempt ${attempt}/${maxRetries} to send to ${chatId}`);
+
+      // Проверяем что клиент подключен
+      if (!client.info?.wid) {
+        throw new Error('Client not ready');
+      }
+
+      const result = await client.sendMessage(chatId, text);
+      console.log(`  Successfully sent to ${chatId}, message ID: ${result.id}`);
+      return true;
+
+    } catch (error) {
+      lastError = error as Error;
+      console.error(`  Attempt ${attempt} failed:`, error);
+
+      // Разные задержки для разных попыток
+      if (attempt < maxRetries) {
+        const delay = attempt * 10000; // 10s, 20s, 30s
+        console.log(`  Waiting ${delay}ms before retry...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+
+  console.error(`  All ${maxRetries} attempts failed for ${chatId}:`, lastError);
+  return false;
+}
+
+// Рассылка с улучшенной обработкой
+async function startBroadcast(ctx: any, accountId: string, text: string) {
+  const acc = waAccounts.get(accountId);
+
+  if (!acc || acc.status !== 'connected') {
+    return ctx.reply('❌ Аккаунт не подключен').catch(() => {});
+  }
+
+  if (!acc.enabled) {
+    return ctx.reply('❌ Этот аккаунт выключен для рассылки').catch(() => {});
+  }
+
+  await ctx.reply('🔍 Поиск архивных чатов...').catch(() => {});
+
+  try {
+    const chats = await acc.client.getChats();
+    const archivedChats = chats.filter((chat: any) => chat.archived);
+
+    console.log(`Found ${archivedChats.length} archived chats for ${accountId}`);
+
+    if (archivedChats.length === 0) {
+      return ctx.reply('❌ Архивные чаты не найдены').catch(() => {});
+    }
+
+    const groups = archivedChats.filter((c: any) => c.isGroup);
+    const individuals = archivedChats.filter((c: any) => !c.isGroup);
+
+    const broadcastId = Date.now().toString();
+    activeBroadcasts.set(broadcastId, {
+      stop: false,
+      sent: 0,
+      failed: 0,
+      total: archivedChats.length,
+      accountId
+    });
+
+    const estimatedMin = archivedChats.length * 10;
+    const hours = Math.floor(estimatedMin / 60);
+    const mins = estimatedMin % 60;
+
+    await ctx.reply(
+      `📦 *Рассылка*\n\n` +
+      `📱 Аккаунт: ${acc.name || acc.phone}\n` +
+      `📊 Найдено: ${archivedChats.length} чатов\n` +
+      `   👥 Групп: ${groups.length}\n` +
+      `   👤 Диалогов: ${individuals.length}\n` +
+      `⏱ Время: ~${hours}ч ${mins}мин\n\n` +
+      `⏳ Начинаем рассылку...`,
+      { parse_mode: 'Markdown' }
+    );
+
+    let sent = 0;
+    let failed = 0;
+
+    for (let i = 0; i < archivedChats.length; i++) {
+      const broadcast = activeBroadcasts.get(broadcastId);
+      if (broadcast?.stop) {
+        await ctx.reply(`⏹ Остановлено\n✅ ${sent} | ❌ ${failed}`).catch(() => {});
+        activeBroadcasts.delete(broadcastId);
+        return;
+      }
+
+      const chat = archivedChats[i];
+
+      // Проверяем что есть ID чата
+      const chatId = chat.id?._serialized || chat.id;
+      if (!chatId) {
+        console.error(`Chat ${i} has no ID, skipping`);
+        failed++;
+        continue;
+      }
+
+      console.log(`[${i+1}/${archivedChats.length}] Sending to: ${chat.name || chatId}`);
+
+      try {
+        const success = await sendMessageWithRetry(acc.client, chatId, text, 3);
+
+        if (success) {
+          sent++;
+          acc.sentToday++;
+          console.log(`  ✓ Success! Total sent: ${sent}`);
+        } else {
+          failed++;
+          acc.failedToday++;
+          console.log(`  ✗ Failed! Total failed: ${failed}`);
+        }
+
+        // Обновляем прогресс
+        if (i % 3 === 0 || i === archivedChats.length - 1) {
+          const remaining = archivedChats.length - (i + 1);
+          const remainingTime = remaining * 10;
+          await ctx.reply(
+            `📊 ${i + 1}/${archivedChats.length}\n` +
+            `✅ ${sent} | ❌ ${failed}\n` +
+            `⏳ Осталось ~${Math.ceil(remainingTime / 60)} мин`,
+          ).catch(() => {});
+        }
+
+      } catch (error) {
+        console.error('Send error:', error);
+        failed++;
+        acc.failedToday++;
+      }
+
+      // Задержка между сообщениями (10 минут)
+      if (i < archivedChats.length - 1) {
+        console.log(`Waiting ${BROADCAST_DELAY / 60000} minutes before next message...`);
+        await new Promise(r => setTimeout(r, BROADCAST_DELAY));
+      }
+    }
+
+    await ctx.reply(
+      `🏁 *Рассылка завершена*\n\n` +
+      `✅ Отправлено: ${sent}\n` +
+      `❌ Ошибок: ${failed}`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+
+    activeBroadcasts.delete(broadcastId);
+
+  } catch (error) {
+    console.error('Broadcast error:', error);
+    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
+  }
+}
+
+// Глобальный обработчик ошибок
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  try {
+    ctx.reply('⚠️ Ошибка. Попробуйте еще раз.').catch(() => {});
+  } catch (e) {
+    console.error('Error in catch:', e);
+  }
+});
+
+// Запуск
+async function main() {
+  console.log('🚀 Starting bot...');
+  console.log('Admin IDs:', ADMIN_IDS);
+  console.log('Accounts loaded:', waAccounts.size);
+
+  await bot.launch();
+  console.log('✅ Bot started');
+}
+
+main().catch(console.error);
+
+process.once('SIGINT', () => {
+  console.log('SIGINT, stopping...');
+  bot.stop('SIGINT');
+  process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+  console.log('SIGTERM, stopping...');
+  bot.stop('SIGTERM');
+  process.exit(0);
+});
