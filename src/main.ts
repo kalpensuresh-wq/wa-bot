@@ -34,9 +34,123 @@ const activeBroadcasts = new Map<string, {
 
 const isAdmin = (userId: number) => ADMIN_IDS.includes(userId);
 
-// === КОНФИГУРАЦИЯ ===
-const BROADCAST_DELAY = 10 * 60 * 1000; // 10 минут между сообщениями
-const MIN_DELAY = 5 * 60 * 1000; // Минимум 5 минут
+// === КОНФИГУРАЦИЯ АНТИ-БАНА ===
+const MIN_DELAY = 8 * 60 * 1000;  // Минимум 8 минут
+const MAX_DELAY = 15 * 60 * 1000;  // Максимум 15 минут
+const PROGRESSIVE_START_DELAY = 12 * 60 * 1000; // Начальная задержка (медленно)
+const PROGRESSIVE_END_DELAY = 8 * 60 * 1000;    // Конечная задержка (быстрее)
+
+// Лимиты защиты
+const MAX_MESSAGES_PER_HOUR = 25;   // Максимум в час
+const MAX_MESSAGES_PER_DAY = 150;   // Максимум в день
+const NIGHT_PAUSE_START = 0;        // Ночная пауза с 00:00
+const NIGHT_PAUSE_END = 8;          // до 08:00
+
+// === ФУНКЦИИ АНТИ-БАНА ===
+
+// Рандомная задержка в диапазоне
+function getRandomDelay(): number {
+  return Math.floor(Math.random() * (MAX_DELAY - MIN_DELAY + 1)) + MIN_DELAY;
+}
+
+// Прогрессивная задержка (начинаем медленно, ускоряемся)
+function getProgressiveDelay(sentCount: number, totalCount: number): number {
+  const progress = sentCount / totalCount; // 0.0 - 1.0
+
+  if (progress < 0.2) {
+    // Первые 20% - медленно
+    return PROGRESSIVE_START_DELAY + Math.floor(Math.random() * 120000);
+  } else if (progress < 0.5) {
+    // 20-50% - средне
+    return (PROGRESSIVE_START_DELAY + PROGRESSIVE_END_DELAY) / 2 + Math.floor(Math.random() * 90000);
+  } else {
+    // 50-100% - быстрее
+    return PROGRESSIVE_END_DELAY + Math.floor(Math.random() * 60000);
+  }
+}
+
+// Имитация человека - симуляция набора текста
+async function simulateHumanTyping(client: Client, chatId: string, duration: number = 2000) {
+  try {
+    await client.sendPresenceAvailable();
+    await client.startTyping(chatId);
+    // Рандомное время набора 1-3 секунды
+    const typingTime = duration + Math.floor(Math.random() * 2000);
+    await new Promise(r => setTimeout(r, typingTime));
+    await client.stopTyping(chatId);
+  } catch (e) {
+    // Игнорируем ошибки typing
+  }
+}
+
+// Замена русских букв на английские (анти-бан вариация текста)
+function varyRussianText(text: string): string {
+  const replacements: { [key: string]: string } = {
+    'а': 'a', 'А': 'A',
+    'е': 'e', 'Е': 'E',
+    'о': 'o', 'О': 'O',
+    'р': 'p', 'Р': 'P',
+    'с': 'c', 'С': 'C',
+    'у': 'y', 'У': 'Y',
+    'х': 'x', 'Х': 'X',
+    'і': 'i', 'І': 'I',
+    'ј': 'j', 'Ј': 'J',
+    'ѕ': 's', 'Ѕ': 'S',
+    'ԁ': 'd', 'ԁ': 'D',
+    'ԛ': 'q', 'Ԛ': 'Q',
+    'ɡ': 'g', 'Ԍ': 'G',
+    'һ': 'h', 'Һ': 'H',
+    'ԛ': 'q',
+  };
+
+  let result = text;
+  let changesCount = 0;
+  const maxChanges = Math.ceil(text.length * 0.3); // Максимум 30% символов
+
+  // Собираем все позиции русских букв
+  const russianPositions: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (replacements[text[i]]) {
+      russianPositions.push(i);
+    }
+  }
+
+  // Рандомно меняем некоторые буквы
+  const positionsToChange = russianPositions
+    .sort(() => Math.random() - 0.5)
+    .slice(0, Math.min(maxChanges, russianPositions.length));
+
+  for (const pos of positionsToChange) {
+    const char = text[pos];
+    if (replacements[char] && Math.random() > 0.5) {
+      result = result.substring(0, pos) + replacements[char] + result.substring(pos + 1);
+      changesCount++;
+    }
+  }
+
+  // Добавляем случайные пробелы/символы в конец (имитация человека)
+  if (Math.random() > 0.5) {
+    const extraChars = [' ', '  ', '.', '..', '...'];
+    result += extraChars[Math.floor(Math.random() * extraChars.length)];
+  }
+
+  return result;
+}
+
+// Проверка ночной паузы
+function isNightPause(): boolean {
+  const hour = new Date().getHours();
+  return hour >= NIGHT_PAUSE_START && hour < NIGHT_PAUSE_END;
+}
+
+// Получить время до конца ночной паузы (в миллисекундах)
+function getTimeUntilMorning(): number {
+  const now = new Date();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(NIGHT_PAUSE_END, 0, 0, 0);
+  return tomorrow.getTime() - now.getTime();
+}
 
 // Главное меню
 const mainMenu = () => Markup.inlineKeyboard([
@@ -465,7 +579,10 @@ bot.action('settings', async (ctx) => {
     `📊 Всего аккаунтов: ${waAccounts.size}\n` +
     `🔄 Подключено: ${[...waAccounts.values()].filter(a => a.status === 'connected').length}\n` +
     `📨 Включено для рассылки: ${[...waAccounts.values()].filter(a => a.enabled).length}\n\n` +
-    `⏱ Задержка между сообщениями: 10 минут`;
+    `🛡️ *Анти-бан система:*\n` +
+    `   ⏱ Задержка: ${Math.round(MIN_DELAY/60000)}-${Math.round(MAX_DELAY/60000)} мин\n` +
+    `   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n` +
+    `   🌙 Ночная пауза: 00:00-08:00`;
 
   await ctx.editMessageText(text, {
     parse_mode: 'Markdown',
@@ -530,333 +647,3 @@ bot.on('text', async (ctx) => {
           `✅ Текст сохранен!\n\n📝 ${ctx.message.text}`,
           { parse_mode: 'Markdown' }
         ).catch(() => {});
-      }
-      userStates.delete(ctx.from!.id);
-      return;
-    }
-
-    if (state.action === 'waiting_broadcast_text') {
-      const accountId = state.accountId;
-      const acc = waAccounts.get(accountId!);
-      if (acc) {
-        acc.customMessage = ctx.message.text;
-        await ctx.reply('✅ Текст сохранен. Нажмите "Да, начать" для рассылки.');
-      }
-      userStates.delete(ctx.from!.id);
-      return;
-    }
-  } catch (error) {
-    console.error('Error in text handler:', error);
-    await ctx.reply('❌ Ошибка: ' + (error as Error).message).catch(() => {});
-    userStates.delete(ctx.from!.id);
-  }
-});
-
-// === ФУНКЦИИ ===
-
-async function addNewAccount(ctx: any, phone: string) {
-  const accountId = `wa_${phone.replace(/\+/g, '')}`;
-
-  if (waAccounts.has(accountId)) {
-    const existing = waAccounts.get(accountId);
-    if (existing?.status === 'connected') {
-      await ctx.reply('✅ Этот номер уже подключен!').catch(() => {});
-      return;
-    }
-    if (existing?.client) {
-      try { await existing.client.destroy(); } catch (e) {}
-    }
-  }
-
-  await ctx.reply('⏳ Создание сессии...\nЭто может занять 10-30 секунд').catch(() => {});
-
-  const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
-  if (!fs.existsSync(sessionsPath)) {
-    fs.mkdirSync(sessionsPath, { recursive: true });
-  }
-
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: accountId,
-      dataPath: sessionsPath,
-    }),
-    puppeteer: {
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-      ],
-    },
-  });
-
-  waAccounts.set(accountId, {
-    client,
-    status: 'connecting',
-    phone,
-    name: phone,
-    customMessage: '',
-    enabled: true, // По умолчанию включен
-    sentToday: 0,
-    failedToday: 0,
-  });
-
-  let qrSent = false;
-
-  client.on('qr', async (qr) => {
-    console.log('QR received for', accountId);
-    const acc = waAccounts.get(accountId);
-    if (acc?.status === 'connected') return;
-
-    if (!qrSent) {
-      qrSent = true;
-      try {
-        const qrDataUrl = await QRCode.toDataURL(qr);
-        const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-        const buffer = Buffer.from(base64Data, 'base64');
-        await ctx.replyWithPhoto({ source: buffer }, {
-          caption: '📱 *Отсканируйте QR-код*\n\nWhatsApp → Настройки → Связанные устройства',
-          parse_mode: 'Markdown'
-        });
-      } catch (e) {
-        console.error('QR send error:', e);
-      }
-    }
-  });
-
-  client.on('ready', async () => {
-    console.log('Client ready for', accountId);
-    const acc = waAccounts.get(accountId);
-    if (acc) {
-      acc.status = 'connected';
-    }
-    await ctx.reply(
-      `✅ *Подключено!*\n\n📞 Телефон: ${phone}\n\n` +
-      `Теперь настройте текст для рассылки в разделе "Аккаунты"`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-  });
-
-  client.on('auth_failure', async (msg) => {
-    console.log('Auth failure for', accountId, msg);
-    const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
-    await ctx.reply(`❌ Ошибка авторизации`).catch(() => {});
-  });
-
-  client.on('disconnected', async () => {
-    console.log('Disconnected:', accountId);
-    const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
-    await ctx.reply(`⚠️ Аккаунт отключился`).catch(() => {});
-  });
-
-  try {
-    await client.initialize();
-  } catch (error) {
-    console.error('Initialize error:', error);
-    const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
-    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
-  }
-}
-
-// Улучшенная функция отправки сообщения с повторными попытками
-async function sendMessageWithRetry(client: Client, chatId: string, text: string, maxRetries: number = 3): Promise<boolean> {
-  let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(`  Attempt ${attempt}/${maxRetries} to send to ${chatId}`);
-
-      // Проверяем что клиент подключен
-      if (!client.info?.wid) {
-        throw new Error('Client not ready');
-      }
-
-      const result = await client.sendMessage(chatId, text);
-      console.log(`  Successfully sent to ${chatId}, message ID: ${result.id}`);
-      return true;
-
-    } catch (error) {
-      lastError = error as Error;
-      console.error(`  Attempt ${attempt} failed:`, error);
-
-      // Разные задержки для разных попыток
-      if (attempt < maxRetries) {
-        const delay = attempt * 10000; // 10s, 20s, 30s
-        console.log(`  Waiting ${delay}ms before retry...`);
-        await new Promise(r => setTimeout(r, delay));
-      }
-    }
-  }
-
-  console.error(`  All ${maxRetries} attempts failed for ${chatId}:`, lastError);
-  return false;
-}
-
-// Рассылка с улучшенной обработкой
-async function startBroadcast(ctx: any, accountId: string, text: string) {
-  const acc = waAccounts.get(accountId);
-
-  if (!acc || acc.status !== 'connected') {
-    return ctx.reply('❌ Аккаунт не подключен').catch(() => {});
-  }
-
-  if (!acc.enabled) {
-    return ctx.reply('❌ Этот аккаунт выключен для рассылки').catch(() => {});
-  }
-
-  await ctx.reply('🔍 Поиск архивных чатов...').catch(() => {});
-
-  try {
-    const chats = await acc.client.getChats();
-    const archivedChats = chats.filter((chat: any) => chat.archived);
-
-    console.log(`Found ${archivedChats.length} archived chats for ${accountId}`);
-
-    if (archivedChats.length === 0) {
-      return ctx.reply('❌ Архивные чаты не найдены').catch(() => {});
-    }
-
-    const groups = archivedChats.filter((c: any) => c.isGroup);
-    const individuals = archivedChats.filter((c: any) => !c.isGroup);
-
-    const broadcastId = Date.now().toString();
-    activeBroadcasts.set(broadcastId, {
-      stop: false,
-      sent: 0,
-      failed: 0,
-      total: archivedChats.length,
-      accountId
-    });
-
-    const estimatedMin = archivedChats.length * 10;
-    const hours = Math.floor(estimatedMin / 60);
-    const mins = estimatedMin % 60;
-
-    await ctx.reply(
-      `📦 *Рассылка*\n\n` +
-      `📱 Аккаунт: ${acc.name || acc.phone}\n` +
-      `📊 Найдено: ${archivedChats.length} чатов\n` +
-      `   👥 Групп: ${groups.length}\n` +
-      `   👤 Диалогов: ${individuals.length}\n` +
-      `⏱ Время: ~${hours}ч ${mins}мин\n\n` +
-      `⏳ Начинаем рассылку...`,
-      { parse_mode: 'Markdown' }
-    );
-
-    let sent = 0;
-    let failed = 0;
-
-    for (let i = 0; i < archivedChats.length; i++) {
-      const broadcast = activeBroadcasts.get(broadcastId);
-      if (broadcast?.stop) {
-        await ctx.reply(`⏹ Остановлено\n✅ ${sent} | ❌ ${failed}`).catch(() => {});
-        activeBroadcasts.delete(broadcastId);
-        return;
-      }
-
-      const chat = archivedChats[i];
-
-      // Проверяем что есть ID чата
-      const chatId = chat.id?._serialized || chat.id;
-      if (!chatId) {
-        console.error(`Chat ${i} has no ID, skipping`);
-        failed++;
-        continue;
-      }
-
-      console.log(`[${i+1}/${archivedChats.length}] Sending to: ${chat.name || chatId}`);
-
-      try {
-        const success = await sendMessageWithRetry(acc.client, chatId, text, 3);
-
-        if (success) {
-          sent++;
-          acc.sentToday++;
-          console.log(`  ✓ Success! Total sent: ${sent}`);
-        } else {
-          failed++;
-          acc.failedToday++;
-          console.log(`  ✗ Failed! Total failed: ${failed}`);
-        }
-
-        // Обновляем прогресс
-        if (i % 3 === 0 || i === archivedChats.length - 1) {
-          const remaining = archivedChats.length - (i + 1);
-          const remainingTime = remaining * 10;
-          await ctx.reply(
-            `📊 ${i + 1}/${archivedChats.length}\n` +
-            `✅ ${sent} | ❌ ${failed}\n` +
-            `⏳ Осталось ~${Math.ceil(remainingTime / 60)} мин`,
-          ).catch(() => {});
-        }
-
-      } catch (error) {
-        console.error('Send error:', error);
-        failed++;
-        acc.failedToday++;
-      }
-
-      // Задержка между сообщениями (10 минут)
-      if (i < archivedChats.length - 1) {
-        console.log(`Waiting ${BROADCAST_DELAY / 60000} minutes before next message...`);
-        await new Promise(r => setTimeout(r, BROADCAST_DELAY));
-      }
-    }
-
-    await ctx.reply(
-      `🏁 *Рассылка завершена*\n\n` +
-      `✅ Отправлено: ${sent}\n` +
-      `❌ Ошибок: ${failed}`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-
-    activeBroadcasts.delete(broadcastId);
-
-  } catch (error) {
-    console.error('Broadcast error:', error);
-    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
-  }
-}
-
-// Глобальный обработчик ошибок
-bot.catch((err, ctx) => {
-  console.error('Bot error:', err);
-  try {
-    ctx.reply('⚠️ Ошибка. Попробуйте еще раз.').catch(() => {});
-  } catch (e) {
-    console.error('Error in catch:', e);
-  }
-});
-
-// Запуск
-async function main() {
-  console.log('🚀 Starting bot...');
-  console.log('Admin IDs:', ADMIN_IDS);
-  console.log('Accounts loaded:', waAccounts.size);
-
-  await bot.launch();
-  console.log('✅ Bot started');
-}
-
-main().catch(console.error);
-
-process.once('SIGINT', () => {
-  console.log('SIGINT, stopping...');
-  bot.stop('SIGINT');
-  process.exit(0);
-});
-
-process.once('SIGTERM', () => {
-  console.log('SIGTERM, stopping...');
-  bot.stop('SIGTERM');
-  process.exit(0);
-});
