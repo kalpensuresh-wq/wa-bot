@@ -1292,4 +1292,87 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
         );
 
         if (success) {
-  
+          sent++;
+          acc.sentToday++;
+          console.log(`  ✓ Success! Total sent: ${sent}`);
+        } else {
+          failed++;
+          acc.failedToday++;
+          console.log(`  ✗ Failed! Total failed: ${failed}`);
+        }
+
+        // Обновляем прогресс
+        if (i % 3 === 0 || i === archivedChats.length - 1) {
+          const remaining = archivedChats.length - (i + 1);
+          const remainingMs = remaining * MIN_DELAY;
+          await ctx.reply(
+            `📊 ${i + 1}/${archivedChats.length}\n` +
+            `✅ ${sent} | ❌ ${failed}\n` +
+            `📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}\n` +
+            `⏳ Осталось ~${Math.ceil(remainingMs / 60000)} мин`,
+          ).catch(() => {});
+        }
+
+      } catch (error) {
+        console.error('Send error:', error);
+        failed++;
+        acc.failedToday++;
+      }
+
+      // Задержка между сообщениями (прогрессивная)
+      if (i < archivedChats.length - 1) {
+        const delay = getProgressiveDelay(sent, archivedChats.length);
+        console.log(`Waiting ${Math.round(delay / 60000)} minutes before next message...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+
+    await ctx.reply(
+      `🏁 *Рассылка завершена*\n\n` +
+      `✅ Отправлено: ${sent}\n` +
+      `❌ Ошибок: ${failed}\n\n` +
+      `📊 Всего за сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+
+    activeBroadcasts.delete(broadcastId);
+
+  } catch (error) {
+    console.error('Broadcast error:', error);
+    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
+  }
+}
+
+// Глобальный обработчик ошибок
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  try {
+    ctx.reply('⚠️ Ошибка. Попробуйте еще раз.').catch(() => {});
+  } catch (e) {
+    console.error('Error in catch:', e);
+  }
+});
+
+// Запуск
+async function main() {
+  console.log('🚀 Starting bot...');
+  console.log('Admin IDs:', ADMIN_IDS);
+  console.log('Accounts loaded:', waAccounts.size);
+
+  await bot.launch();
+  console.log('✅ Bot started');
+}
+
+main().catch(console.error);
+
+process.once('SIGINT', () => {
+  console.log('SIGINT, stopping...');
+  bot.stop('SIGINT');
+  process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+  console.log('SIGTERM, stopping...');
+  bot.stop('SIGTERM');
+  process.exit(0);
+});
