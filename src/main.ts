@@ -640,7 +640,6 @@ bot.action(/^broadcast_acc_(.+)$/, async (ctx) => {
   }
 
   if (!acc.enabled) {
-    await ctx.editMessageText('❌ Этот аккаунт выключен для рассылки\n\nВключите е
     await ctx.editMessageText('❌ Этот аккаунт выключен для рассылки\n\nВключите его в разделе "Аккаунты"', {
       ...broadcastSelectMenu()
     }).catch(() => {});
