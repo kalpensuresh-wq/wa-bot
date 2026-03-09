@@ -46,6 +46,23 @@ const MAX_MESSAGES_PER_DAY = 150;   // Максимум в день
 const NIGHT_PAUSE_START = 0;        // Ночная пауза с 00:00
 const NIGHT_PAUSE_END = 8;          // до 08:00
 
+// Конфигурация авто-присоединения
+const JOIN_DELAY_MIN = 30 * 60 * 1000;  // Минимум 30 минут между присоединениями
+const JOIN_DELAY_MAX = 60 * 60 * 1000;  // Максимум 60 минут
+const MAX_JOINS_PER_DAY = 30;           // Максимум присоединений в день
+
+// Хранилище для авто-присоединения
+const activeJoins = new Map<string, {
+  stop: boolean;
+  joined: number;
+  failed: number;
+  total: number;
+  accountId: string;
+}>();
+
+// Список ссылок для присоединения (в памяти)
+const pendingGroupLinks = new Map<string, string[]>();
+
 // === ФУНКЦИИ АНТИ-БАНА ===
 
 // Рандомная задержка в диапазоне
@@ -152,10 +169,73 @@ function getTimeUntilMorning(): number {
   return tomorrow.getTime() - now.getTime();
 }
 
+// Рандомная задержка для присоединения к чатам
+function getRandomJoinDelay(): number {
+  return Math.floor(Math.random() * (JOIN_DELAY_MAX - JOIN_DELAY_MIN + 1)) + JOIN_DELAY_MIN;
+}
+
+// Извлечь код приглашения из ссылки
+function extractInviteCode(link: string): string | null {
+  // Формат: https://chat.whatsapp.com/LwhLlYTokDdIPKqsroAeBo
+  // или просто код: LwhLlYTokDdIPKqsroAeBo
+
+  const patterns = [
+    /chat\.whatsapp\.com\/([a-zA-Z0-9]{20,})/i,
+    /invite\.whatsapp\.com\/([a-zA-Z0-9]{20,})/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = link.match(pattern);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  // Если это просто код без ссылки (20+ символов)
+  if (/^[a-zA-Z0-9]{20,}$/.test(link.trim())) {
+    return link.trim();
+  }
+
+  return null;
+}
+
+// Попытка присоединиться к группе по коду приглашения
+async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ success: boolean; error?: string; needsApproval?: boolean }> {
+  try {
+    console.log(`  Joining group with invite code: ${inviteCode}`);
+
+    // Метод acceptInvite принимает код приглашения
+    const result = await client.acceptInvite(inviteCode);
+
+    console.log(`  ✓ Successfully joined group`);
+    return { success: true };
+
+  } catch (error: any) {
+    const errorMessage = error.message || String(error);
+    console.error(`  ✗ Join failed:`, errorMessage);
+
+    // Разные типы ошибок
+    if (errorMessage.includes('invalid') || errorMessage.includes('expired')) {
+      return { success: false, error: 'Ссылка недействительна или истекла' };
+    }
+
+    if (errorMessage.includes('approval') || errorMessage.includes('join') || errorMessage.includes('require')) {
+      return { success: false, error: 'Требуется одобрение администратора', needsApproval: true };
+    }
+
+    if (errorMessage.includes('not found') || errorMessage.includes('404')) {
+      return { success: false, error: 'Группа не найдена' };
+    }
+
+    return { success: false, error: errorMessage };
+  }
+}
+
 // Главное меню
 const mainMenu = () => Markup.inlineKeyboard([
   [Markup.button.callback('📱 Аккаунты', 'accounts')],
   [Markup.button.callback('📨 Рассылка', 'broadcast_menu')],
+  [Markup.button.callback('🔗 Присоединение к чатам', 'join_menu')],
   [Markup.button.callback('⚙️ Настройки', 'settings')],
 ]);
 
@@ -562,481 +642,4 @@ bot.action(/^confirm_broadcast_(.+)$/, async (ctx) => {
   const accountId = ctx.match![1];
   const acc = waAccounts.get(accountId);
 
-  if (!acc || acc.status !== 'connected' || !acc.customMessage || !acc.enabled) {
-    await ctx.reply('❌ Аккаунт не готов к рассылке').catch(() => {});
-    return;
-  }
-
-  await startBroadcast(ctx, accountId, acc.customMessage);
-});
-
-// === НАСТРОЙКИ ===
-
-bot.action('settings', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-
-  const text = `⚙️ *Настройки*\n\n` +
-    `📊 Всего аккаунтов: ${waAccounts.size}\n` +
-    `🔄 Подключено: ${[...waAccounts.values()].filter(a => a.status === 'connected').length}\n` +
-    `📨 Включено для рассылки: ${[...waAccounts.values()].filter(a => a.enabled).length}\n\n` +
-    `🛡️ *Анти-бан система:*\n` +
-    `   ⏱ Задержка: ${Math.round(MIN_DELAY/60000)}-${Math.round(MAX_DELAY/60000)} мин\n` +
-    `   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n` +
-    `   🌙 Ночная пауза: 00:00-08:00`;
-
-  await ctx.editMessageText(text, {
-    parse_mode: 'Markdown',
-    ...settingsMenu()
-  }).catch(() => {});
-});
-
-bot.action('stats', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-
-  let text = '📊 *Статистика*\n\n';
-
-  let totalSent = 0;
-  let totalFailed = 0;
-
-  waAccounts.forEach((acc, id) => {
-    totalSent += acc.sentToday;
-    totalFailed += acc.failedToday;
-    text += `📱 ${acc.name || acc.phone || id}:\n`;
-    text += `   ✅ Отправлено: ${acc.sentToday}\n`;
-    text += `   ❌ Ошибок: ${acc.failedToday}\n\n`;
-  });
-
-  text += `📈 *Всего:*\n`;
-  text += `   ✅ Отправлено: ${totalSent}\n`;
-  text += `   ❌ Ошибок: ${totalFailed}`;
-
-  await ctx.editMessageText(text, {
-    parse_mode: 'Markdown',
-    ...settingsMenu()
-  }).catch(() => {});
-});
-
-// === ОБРАБОТЧИКИ СООБЩЕНИЙ ===
-
-bot.on('text', async (ctx) => {
-  if (!isAdmin(ctx.from!.id)) return;
-  const state = userStates.get(ctx.from!.id);
-  if (!state) return;
-
-  try {
-    if (state.action === 'waiting_phone') {
-      const phone = ctx.message.text.trim();
-      const cleanPhone = phone.replace(/[^0-9+]/g, '');
-      if (cleanPhone.length < 10) {
-        await ctx.reply('❌ Неверный формат номера. Введите в формате +79991234567');
-        return;
-      }
-
-      await addNewAccount(ctx, cleanPhone);
-      userStates.delete(ctx.from!.id);
-      return;
-    }
-
-    if (state.action === 'waiting_custom_message') {
-      const accountId = state.accountId;
-      const acc = waAccounts.get(accountId!);
-      if (acc) {
-        acc.customMessage = ctx.message.text;
-                await ctx.reply('✅ Текст сохранен. Нажмите "Да, начать" для рассылки.');
-      }
-      userStates.delete(ctx.from!.id);
-      return;
-    }
-  } catch (error) {
-    console.error('Error in text handler:', error);
-    await ctx.reply('❌ Ошибка: ' + (error as Error).message).catch(() => {});
-    userStates.delete(ctx.from!.id);
-  }
-});
-
-// === ФУНКЦИИ ===
-
-async function addNewAccount(ctx: any, phone: string) {
-  const accountId = `wa_${phone.replace(/\+/g, '')}`;
-
-  if (waAccounts.has(accountId)) {
-    const existing = waAccounts.get(accountId);
-    if (existing?.status === 'connected') {
-      await ctx.reply('✅ Этот номер уже подключен!').catch(() => {});
-      return;
-    }
-    if (existing?.client) {
-      try { await existing.client.destroy(); } catch (e) {}
-    }
-  }
-
-  await ctx.reply('⏳ Создание сессии...\nЭто может занять 10-30 секунд').catch(() => {});
-
-  const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
-  if (!fs.existsSync(sessionsPath)) {
-    fs.mkdirSync(sessionsPath, { recursive: true });
-  }
-
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: accountId,
-      dataPath: sessionsPath,
-    }),
-    puppeteer: {
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-      ],
-    },
-  });
-
-  waAccounts.set(accountId, {
-    client,
-    status: 'connecting',
-    phone,
-    name: phone,
-    customMessage: '',
-    enabled: true, // По умолчанию включен
-    sentToday: 0,
-    failedToday: 0,
-  });
-
-  let qrSent = false;
-
-  client.on('qr', async (qr) => {
-    console.log('QR received for', accountId);
-    const acc = waAccounts.get(accountId);
-    if (acc?.status === 'connected') return;
-
-    if (!qrSent) {
-      qrSent = true;
-      try {
-        const qrDataUrl = await QRCode.toDataURL(qr);
-        const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-        const buffer = Buffer.from(base64Data, 'base64');
-        await ctx.replyWithPhoto({ source: buffer }, {
-          caption: '📱 *Отсканируйте QR-код*\n\nWhatsApp → Настройки → Связанные устройства',
-          parse_mode: 'Markdown'
-        });
-      } catch (e) {
-        console.error('QR send error:', e);
-      }
-    }
-  });
-
-  client.on('ready', async () => {
-    console.log('Client ready for', accountId);
-    const acc = waAccounts.get(accountId);
-    if (acc) {
-      acc.status = 'connected';
-    }
-    await ctx.reply(
-      `✅ *Подключено!*\n\n📞 Телефон: ${phone}\n\n` +
-      `Теперь настройте текст для рассылки в разделе "Аккаунты"`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-  });
-
-  client.on('auth_failure', async (msg) => {
-    console.log('Auth failure for', accountId, msg);
-    const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
-    await ctx.reply(`❌ Ошибка авторизации`).catch(() => {});
-  });
-
-  client.on('disconnected', async () => {
-    console.log('Disconnected:', accountId);
-    const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
-    await ctx.reply(`⚠️ Аккаунт отключился`).catch(() => {});
-  });
-
-  try {
-    await client.initialize();
-  } catch (error) {
-    console.error('Initialize error:', error);
-    const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
-    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
-  }
-}
-
-// Улучшенная функция отправки сообщения с повторными попытками и анти-бан функциями
-async function sendMessageWithRetry(
-  client: Client,
-  chatId: string,
-  baseText: string,
-  messageNumber: number,
-  totalMessages: number,
-  useTypingSimulation: boolean = true,
-  useTextVariation: boolean = true,
-  maxRetries: number = 3
-): Promise<boolean> {
-  let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(`  Attempt ${attempt}/${maxRetries} to send to ${chatId}`);
-
-      // Проверяем что клиент подключен
-      if (!client.info?.wid) {
-        throw new Error('Client not ready');
-      }
-
-      // Вариация текста (каждое сообщение немного отличается)
-      let messageText = baseText;
-      if (useTextVariation && messageNumber > 0) {
-        messageText = varyRussianText(baseText);
-      }
-
-      // Имитация набора текста (для первых попыток)
-      if (useTypingSimulation && attempt === 1) {
-        await simulateHumanTyping(client, chatId);
-      }
-
-      const result = await client.sendMessage(chatId, messageText);
-      console.log(`  Successfully sent to ${chatId}, message ID: ${result.id}`);
-      return true;
-
-    } catch (error) {
-      lastError = error as Error;
-      console.error(`  Attempt ${attempt} failed:`, error);
-
-      // Разные задержки для разных попыток
-      if (attempt < maxRetries) {
-        const delay = attempt * 10000; // 10s, 20s, 30s
-        console.log(`  Waiting ${delay}ms before retry...`);
-        await new Promise(r => setTimeout(r, delay));
-      }
-    }
-  }
-
-  console.error(`  All ${maxRetries} attempts failed for ${chatId}:`, lastError);
-  return false;
-}
-
-// Рассылка с анти-бан системой
-async function startBroadcast(ctx: any, accountId: string, text: string) {
-  const acc = waAccounts.get(accountId);
-
-  if (!acc || acc.status !== 'connected') {
-    return ctx.reply('❌ Аккаунт не подключен').catch(() => {});
-  }
-
-  if (!acc.enabled) {
-    return ctx.reply('❌ Этот аккаунт выключен для рассылки').catch(() => {});
-  }
-
-  // Проверка дневного лимита
-  if (acc.sentToday >= MAX_MESSAGES_PER_DAY) {
-    return ctx.reply(`❌ Достигнут дневной лимит (${MAX_MESSAGES_PER_DAY} сообщений)`).catch(() => {});
-  }
-
-  await ctx.reply('🔍 Поиск архивных чатов...').catch(() => {});
-
-  try {
-    const chats = await acc.client.getChats();
-    const archivedChats = chats.filter((chat: any) => chat.archived);
-
-    console.log(`Found ${archivedChats.length} archived chats for ${accountId}`);
-
-    if (archivedChats.length === 0) {
-      return ctx.reply('❌ Архивные чаты не найдены').catch(() => {});
-    }
-
-    const groups = archivedChats.filter((c: any) => c.isGroup);
-    const individuals = archivedChats.filter((c: any) => !c.isGroup);
-
-    const broadcastId = Date.now().toString();
-    activeBroadcasts.set(broadcastId, {
-      stop: false,
-      sent: 0,
-      failed: 0,
-      total: archivedChats.length,
-      accountId
-    });
-
-    // Расчёт времени с учётом прогрессивной задержки
-    const avgDelay = (MIN_DELAY + MAX_DELAY) / 2;
-    const estimatedMin = Math.ceil(archivedChats.length * (avgDelay / 60000));
-    const hours = Math.floor(estimatedMin / 60);
-    const mins = estimatedMin % 60;
-
-    await ctx.reply(
-      `🛡️ *Анти-бан Рассылка*\n\n` +
-      `📱 Аккаунт: ${acc.name || acc.phone}\n` +
-      `📊 Найдено: ${archivedChats.length} чатов\n` +
-      `   👥 Групп: ${groups.length}\n` +
-      `   👤 Диалогов: ${individuals.length}\n\n` +
-      `🛡️ *Защита:*\n` +
-      `   ⏱ Задержка: 8-15 мин (прогрессивная)\n` +
-      `   🤖 Имитация человека: ВКЛ\n` +
-      `   🔤 Вариация текста: ВКЛ\n` +
-      `   🌙 Ночная пауза: 00:00-08:00\n` +
-      `   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n\n` +
-      `⏱ Примерное время: ~${hours}ч ${mins}мин\n\n` +
-      `⏳ Начинаем рассылку...`,
-      { parse_mode: 'Markdown' }
-    );
-
-    let sent = 0;
-    let failed = 0;
-
-    for (let i = 0; i < archivedChats.length; i++) {
-      const broadcast = activeBroadcasts.get(broadcastId);
-      if (broadcast?.stop) {
-        await ctx.reply(`⏹ Остановлено\n✅ ${sent} | ❌ ${failed}`).catch(() => {});
-        activeBroadcasts.delete(broadcastId);
-        return;
-      }
-
-      // Проверка ночной паузы
-      if (isNightPause()) {
-        const waitTime = getTimeUntilMorning();
-        const hoursLeft = Math.floor(waitTime / 3600000);
-        console.log(`🌙 Night pause detected. Waiting ${hoursLeft} hours until morning...`);
-        await ctx.reply(
-          `🌙 *Ночная пауза*\n\n` +
-          `Бот приостановлен до 08:00\n` +
-          `Осталось: ~${hoursLeft} ч\n\n` +
-          `Продолжится автоматически утром.`,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-
-        await new Promise(r => setTimeout(r, waitTime));
-      }
-
-      // Проверка дневного лимита
-      if (acc.sentToday >= MAX_MESSAGES_PER_DAY) {
-        await ctx.reply(
-          `⚠️ *Достигнут дневной лимит*\n\n` +
-          `Отправлено сегодня: ${acc.sentToday}\n` +
-          `Максимум: ${MAX_MESSAGES_PER_DAY}\n\n` +
-          `Рассылка приостановлена.`,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-        activeBroadcasts.delete(broadcastId);
-        return;
-      }
-
-      const chat = archivedChats[i];
-
-      // Проверяем что есть ID чата
-      const chatId = chat.id?._serialized || chat.id;
-      if (!chatId) {
-        console.error(`Chat ${i} has no ID, skipping`);
-        failed++;
-        continue;
-      }
-
-      console.log(`[${i+1}/${archivedChats.length}] Sending to: ${chat.name || chatId}`);
-
-      try {
-        // Используем прогрессивную задержку
-        const delay = getProgressiveDelay(sent, archivedChats.length);
-        console.log(`  Using progressive delay: ${Math.round(delay / 60000)} minutes`);
-
-        const success = await sendMessageWithRetry(
-          acc.client,
-          chatId,
-          text,
-          i,
-          archivedChats.length,
-          true,
-          true,
-          3
-        );
-
-        if (success) {
-          sent++;
-          acc.sentToday++;
-          console.log(`  ✓ Success! Total sent: ${sent}`);
-        } else {
-          failed++;
-          acc.failedToday++;
-          console.log(`  ✗ Failed! Total failed: ${failed}`);
-        }
-
-        // Обновляем прогресс
-        if (i % 3 === 0 || i === archivedChats.length - 1) {
-          const remaining = archivedChats.length - (i + 1);
-          const remainingMs = remaining * MIN_DELAY;
-          await ctx.reply(
-            `📊 ${i + 1}/${archivedChats.length}\n` +
-            `✅ ${sent} | ❌ ${failed}\n` +
-            `📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}\n` +
-            `⏳ Осталось ~${Math.ceil(remainingMs / 60000)} мин`,
-          ).catch(() => {});
-        }
-
-      } catch (error) {
-        console.error('Send error:', error);
-        failed++;
-        acc.failedToday++;
-      }
-
-      // Задержка между сообщениями (прогрессивная)
-      if (i < archivedChats.length - 1) {
-        const delay = getProgressiveDelay(sent, archivedChats.length);
-        console.log(`Waiting ${Math.round(delay / 60000)} minutes before next message...`);
-        await new Promise(r => setTimeout(r, delay));
-      }
-    }
-
-    await ctx.reply(
-      `🏁 *Рассылка завершена*\n\n` +
-      `✅ Отправлено: ${sent}\n` +
-      `❌ Ошибок: ${failed}\n\n` +
-      `📊 Всего за сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-
-    activeBroadcasts.delete(broadcastId);
-
-  } catch (error) {
-    console.error('Broadcast error:', error);
-    await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
-  }
-}
-
-// Глобальный обработчик ошибок
-bot.catch((err, ctx) => {
-  console.error('Bot error:', err);
-  try {
-    ctx.reply('⚠️ Ошибка. Попробуйте еще раз.').catch(() => {});
-  } catch (e) {
-    console.error('Error in catch:', e);
-  }
-});
-
-// Запуск
-async function main() {
-  console.log('🚀 Starting bot...');
-  console.log('Admin IDs:', ADMIN_IDS);
-  console.log('Accounts loaded:', waAccounts.size);
-
-  await bot.launch();
-  console.log('✅ Bot started');
-}
-
-main().catch(console.error);
-
-process.once('SIGINT', () => {
-  console.log('SIGINT, stopping...');
-  bot.stop('SIGINT');
-  process.exit(0);
-});
-
-process.once('SIGTERM', () => {
-  console.log('SIGTERM, stopping...');
-  bot.stop('SIGTERM');
-  process.exit(0);
-});
+  if (!acc || acc.status !== 
