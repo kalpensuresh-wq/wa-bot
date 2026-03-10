@@ -1,6 +1,6 @@
 {
   "name": "wa-archive-bot",
-  "version": "1.0.0",
+  "versi on": "1.0.0",
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",
