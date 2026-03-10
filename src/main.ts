@@ -4,8 +4,6 @@ import * as QRCode from 'qrcode';
 import * as fs from 'fs';
 import 'dotenv/config';
 
-console.log('🔥🔥🔥 TEST: This is the NEW code with 4 buttons! 🔥🔥🔥');
-
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
 
 const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
