@@ -597,4 +597,312 @@ bot.action('broadcast_menu', async (ctx) => {
 
 // Выбрали аккаунт для рассылки
 bot.action(/^broadcast_acc_(.+)$/, async (ctx) => {
-  aw
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') {
+    await ctx.editMessageText('❌ Аккаунт не подключен', {
+      ...broadcastSelectMenu()
+    }).catch(() => {});
+    return;
+  }
+  if (!acc.enabled) {
+    await ctx.editMessageText('❌ Этот аккаунт выключен для рассылки\n\nВключите его в разделе "Аккаунты"', {
+      ...broadcastSelectMenu()
+    }).catch(() => {});
+    return;
+  }
+  if (!acc.customMessage) {
+    userStates.set(ctx.from!.id, { action: 'waiting_broadcast_text', accountId });
+    await ctx.editMessageText(
+      `📨 *Рассылка с ${acc.name || acc.phone}*\n\n` +
+      `⚠️ Текст не настроен!\n\n` +
+      `Введите текст для рассылки:`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'broadcast_menu')]])
+      }
+    ).catch(() => {});
+    return;
+  }
+  // Показываем подтверждение
+  await ctx.editMessageText(
+    `📨 *Подтверждение рассылки*\n\n` +
+    `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
+    `📝 *Текст:*\n${acc.customMessage}\n\n` +
+    `⚠️ Отправить во все архивные чаты?\n` +
+    `⏱ Задержка: 10 минут между сообщениями\n` +
+    `🔄 После каждого сообщения - ожидание`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('✅ Да, начать', `confirm_broadcast_${accountId}`)],
+          [Markup.button.callback('❌ Отмена', 'broadcast_menu')]
+        ]
+      }
+    }
+  ).catch(() => {});
+});
+
+// Подтверждение рассылки
+bot.action(/^confirm_broadcast_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected' || !acc.customMessage || !acc.enabled) {
+    await ctx.reply('❌ Аккаунт не готов к рассылке').catch(() => {});
+    return;
+  }
+  await startBroadcast(ctx, accountId, acc.customMessage);
+});
+
+// === ПРИСОЕДИНЕНИЕ К ЧАТАМ ===
+
+// Меню присоединения - открывается при нажатии кнопки "🔗 Присоединение к чатам"
+bot.action('join_menu', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+
+  // Проверяем есть ли подключенные аккаунты
+  const connectedAccounts = [...waAccounts.values()].filter(a => a.status === 'connected');
+
+  let text = '🔗 *Присоединение к чатам*\n\n';
+  text += `📋 Отправьте ссылки на группы (одну или несколько)\n`;
+  text += `Формат: https://chat.whatsapp.com/Код\n`;
+  text += `или просто код приглашения\n\n`;
+  text += `🛡️ *Защита:*\n`;
+  text += ` ⏱ Задержка: 30-60 мин между присоединениями\n`;
+  text += ` 📊 Лимит: ${MAX_JOINS_PER_DAY} в день\n`;
+  text += ` 🌙 Ночная пауза: 00:00-08:00\n\n`;
+
+  if (connectedAccounts.length === 0) {
+    text += `❌ *Нет подключенных аккаунтов*\n`;
+    text += `Сначала добавьте аккаунт в разделе "Аккаунты"`;
+  } else {
+    text += `✅ Готовы к присоединению: ${connectedAccounts.length} аккаунт(ов)\n\n`;
+    text += `Выберите аккаунт для присоединения:`;
+  }
+
+  await ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    ...joinSelectMenu()
+  }).catch(() => {});
+});
+
+// Выбрали аккаунт для присоединения
+bot.action(/^join_acc_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  const acc = waAccounts.get(accountId);
+
+  if (!acc || acc.status !== 'connected') {
+    await ctx.editMessageText('❌ Аккаунт не подключен', {
+      ...joinSelectMenu()
+    }).catch(() => {});
+    return;
+  }
+
+  // Устанавливаем состояние ожидания ссылок
+  userStates.set(ctx.from!.id, { action: 'waiting_group_links', accountId });
+
+  await ctx.editMessageText(
+    `🔗 *Присоединение к чатам*\n\n` +
+    `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
+    `Введите ссылки на группы (одну или несколько через пробел или новую строку):\n\n` +
+    `Пример:\n` +
+    `https://chat.whatsapp.com/LwhLlYTokDdIPKqsroAeBo\n` +
+    `https://chat.whatsapp.com/FLN5Sc01iNZ5kFxlGnhJCY\n\n` +
+    `Или просто коды приглашения (без https://chat.whatsapp.com/)`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'join_menu')]])
+    }
+  ).catch(() => {});
+});
+
+// Подтверждение присоединения - обработчик кнопки "✅ Да, начать"
+bot.action(/^confirm_join_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const accountId = ctx.match![1];
+  const acc = waAccounts.get(accountId);
+
+  if (!acc || acc.status !== 'connected') {
+    await ctx.reply('❌ Аккаунт не подключен').catch(() => {});
+    return;
+  }
+
+  // Получаем сохраненные ссылки
+  const links = pendingGroupLinks.get(accountId);
+
+  if (!links || links.length === 0) {
+    await ctx.reply('❌ Нет ссылок для присоединения. Сначала введите ссылки.').catch(() => {});
+    return;
+  }
+
+  // Запускаем процесс присоединения
+  await startJoinProcess(ctx, accountId, links);
+});
+
+// Запуск процесса присоединения
+async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') {
+    return ctx.reply('❌ Аккаунт не подключен').catch(() => {});
+  }
+
+  // Фильтруем только валидные ссылки
+  const validLinks: string[] = [];
+  for (const link of links) {
+    const code = extractInviteCode(link);
+    if (code) {
+      validLinks.push(code);
+    }
+  }
+
+  if (validLinks.length === 0) {
+    return ctx.reply('❌ Не найдено валидных ссылок').catch(() => {});
+  }
+
+  const joinId = Date.now().toString();
+  activeJoins.set(joinId, {
+    stop: false,
+    joined: 0,
+    failed: 0,
+    total: validLinks.length,
+    accountId
+  });
+
+  await ctx.reply(
+    `🔗 *Присоединение к чатам*\n\n` +
+    `📱 Аккаунт: ${acc.name || acc.phone}\n` +
+    `📊 Найдено ссылок: ${validLinks.length}\n\n` +
+    `🛡️ *Защита:*\n` +
+    ` ⏱ Задержка: 30-60 мин\n` +
+    ` 📊 Лимит/день: ${MAX_JOINS_PER_DAY}\n\n` +
+    `⏳ Начинаем...`,
+    { parse_mode: 'Markdown' }
+  );
+
+  let joined = 0;
+  let failed = 0;
+  let needsApproval = 0;
+
+  for (let i = 0; i < validLinks.length; i++) {
+    const join = activeJoins.get(joinId);
+    if (join?.stop) {
+      await ctx.reply(`⏹ Остановлено\n✅ Присоединено: ${joined} | ❌ Ошибок: ${failed} | ⏳ Ожидает одобрения: ${needsApproval}`).catch(() => {});
+      activeJoins.delete(joinId);
+      return;
+    }
+
+    // Проверка ночной паузы
+    if (isNightPause()) {
+      const waitTime = getTimeUntilMorning();
+      const hoursLeft = Math.floor(waitTime / 3600000);
+      await ctx.reply(
+        `🌙 *Ночная пауза*\n\nБот приостановлен до 08:00\nОсталось: ~${hoursLeft} ч`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+      await new Promise(r => setTimeout(r, waitTime));
+    }
+
+    const inviteCode = validLinks[i];
+    console.log(`[${i+1}/${validLinks.length}] Joining: ${inviteCode}`);
+
+    try {
+      const result = await joinGroupByInvite(acc.client, inviteCode);
+      if (result.success) {
+        joined++;
+        console.log(`  ✓ Joined successfully`);
+      } else if (result.needsApproval) {
+        needsApproval++;
+        console.log(`  ⏳ Needs approval: ${result.error}`);
+      } else {
+        failed++;
+        console.log(`  ✗ Failed: ${result.error}`);
+      }
+
+      // Прогресс каждые 3
+      if (i % 3 === 0 || i === validLinks.length - 1) {
+        await ctx.reply(
+          `📊 ${i + 1}/${validLinks.length}\n` +
+          `✅ Присоединено: ${joined}\n` +
+          `❌ Ошибок: ${failed}\n` +
+          `⏳ Ожидает одобрения: ${needsApproval}`
+        ).catch(() => {});
+      }
+    } catch (error) {
+      console.error('Join error:', error);
+      failed++;
+    }
+
+    // Задержка между присоединениями
+    if (i < validLinks.length - 1) {
+      const delay = getRandomJoinDelay();
+      console.log(`Waiting ${Math.round(delay / 60000)} minutes before next join...`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+
+  // Очищаем сохраненные ссылки после завершения
+  pendingGroupLinks.delete(accountId);
+
+  await ctx.reply(
+    `🏁 *Присоединение завершено*\n\n` +
+    `✅ Присоединено: ${joined}\n` +
+    `❌ Ошибок: ${failed}\n` +
+    `⏳ Требует одобрения: ${needsApproval}`,
+    { parse_mode: 'Markdown' }
+  ).catch(() => {});
+
+  activeJoins.delete(joinId);
+}
+
+// === НАСТРОЙКИ ===
+
+bot.action('settings', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const text = `⚙️ *Настройки*\n\n` +
+    `📊 Всего аккаунтов: ${waAccounts.size}\n` +
+    `🔄 Подключено: ${[...waAccounts.values()].filter(a => a.status === 'connected').length}\n` +
+    `📨 Включено для рассылки: ${[...waAccounts.values()].filter(a => a.enabled).length}\n\n` +
+    `🛡️ *Анти-бан система:*\n` +
+    ` ⏱ Задержка: ${Math.round(MIN_DELAY/60000)}-${Math.round(MAX_DELAY/60000)} мин\n` +
+    ` 📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n` +
+    ` 🌙 Ночная пауза: 00:00-08:00`;
+  await ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    ...settingsMenu()
+  }).catch(() => {});
+});
+
+bot.action('stats', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  let text = '📊 *Статистика*\n\n';
+  let totalSent = 0;
+  let totalFailed = 0;
+  waAccounts.forEach((acc, id) => {
+    totalSent += acc.sentToday;
+    totalFailed += acc.failedToday;
+    text += `📱 ${acc.name || acc.phone || id}:\n`;
+    text += ` ✅ Отправлено: ${acc.sentToday}\n`;
+    text += ` ❌ Ошибок: ${acc.failedToday}\n\n`;
+  });
+  text += `📈 *Всего:*\n`;
+  text += ` ✅ Отправлено: ${totalSent}\n`;
+  text += ` ❌ Ошибок: ${totalFailed}`;
+  await ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    ...settingsMenu()
+  }).catch(() => {});
+});
+
+// === ОБРАБОТЧИКИ СООБЩЕНИЙ ===
+
+bot.on('text', async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) return;
+  const state = userStates.get(ctx.from!.id);
+  if (!state) return;
+
+  try {
+    // QR-код авторизация
