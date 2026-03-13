@@ -43,8 +43,8 @@ const PROGRESSIVE_END_DELAY = 8 * 60 * 1000;    // Конечная задерж
 // Лимиты защиты
 const MAX_MESSAGES_PER_HOUR = 25;   // Максимум в час
 const MAX_MESSAGES_PER_DAY = 150;   // Максимум в день
-const NIGHT_PAUSE_START = 0;        // Ночная пауза с 00:00
-const NIGHT_PAUSE_END = 8;          // до 08:00
+const NIGHT_PAUSE_START = 24;       // Ночная пауза ОТКЛЮЧЕНА
+const NIGHT_PAUSE_END = 24;          // (24 = никогда не срабатывает)
 
 // Конфигурация авто-присоединения
 const JOIN_DELAY_MIN = 30 * 60 * 1000;  // Минимум 30 минут между присоединениями
@@ -718,13 +718,12 @@ bot.action('join_menu', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 
   let text = '🔗 *Присоединение к чатам*\n\n';
-  text += `📋 Отправьте ссылки на группы (одну или несколько)\n`;
+  text += `📋 Отправьте ссылки на группы (одну или несколько через пробел)\n`;
   text += `Формат: https://chat.whatsapp.com/Код\n`;
   text += `или просто код приглашения\n\n`;
   text += `🛡️ *Защита:*\n`;
   text += `   ⏱ Задержка: 30-60 мин между присоединениями\n`;
-  text += `   📊 Лимит: ${MAX_JOINS_PER_DAY} в день\n`;
-  text += `   🌙 Ночная пауза: 00:00-08:00\n\n`;
+  text += `   📊 Лимит: ${MAX_JOINS_PER_DAY} в день\n\n`;
   text += `Выберите аккаунт для присоединения:`;
 
   await ctx.editMessageText(text, {
@@ -751,10 +750,9 @@ bot.action(/^join_acc_(.+)$/, async (ctx) => {
   await ctx.editMessageText(
     `🔗 *Присоединение к чатам*\n\n` +
     `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
-    `Введите ссылки на группы (одну или несколько через пробел или новую строку):\n\n` +
+    `Введите ссылки на группы через пробел:\n\n` +
     `Пример:\n` +
-    `https://chat.whatsapp.com/LwhLlYTokDdIPKqsroAeBo\n` +
-    `https://chat.whatsapp.com/FLN5Sc01iNZ5kFxlGnhJCY`,
+    `https://chat.whatsapp.com/DiNo0pMTcZ28k2jf6rNpex https://chat.whatsapp.com/DkUIXcma2Lx29eUH3eX17P https://chat.whatsapp.com/L7MY2T19YCtKN2bEXxeASa`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'join_menu')]])
@@ -911,7 +909,7 @@ bot.action('settings', async (ctx) => {
     `🛡️ *Анти-бан система:*\n` +
     `   ⏱ Задержка: ${Math.round(MIN_DELAY/60000)}-${Math.round(MAX_DELAY/60000)} мин\n` +
     `   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n` +
-    `   🌙 Ночная пауза: 00:00-08:00`;
+    `   🌙 Ночная пауза: ОТКЛЮЧЕНА`;
 
   await ctx.editMessageText(text, {
     parse_mode: 'Markdown',
