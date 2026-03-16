@@ -49,7 +49,8 @@ const NIGHT_PAUSE_END = 24;          // (24 = никогда не срабаты
 // Конфигурация авто-присоединения
 const JOIN_DELAY_MIN = 30 * 60 * 1000;  // Минимум 30 минут между присоединениями
 const JOIN_DELAY_MAX = 60 * 60 * 1000;  // Максимум 60 минут
-const MAX_JOINS_PER_DAY = 30;           // Максимум присоединений в день
+const MAX_JOINS_BEFORE_BREAK = 30;      // После 30 чатов - перерыв
+const JOIN_BREAK_DURATION = 4 * 60 * 60 * 1000; // 4 часа перерыв
 
 // Хранилище для авто-присоединения
 const activeJoins = new Map<string, {
@@ -323,6 +324,25 @@ bot.start(async (ctx) => {
     parse_mode: 'Markdown',
     ...mainMenu()
   });
+});
+
+// Команда /stop для остановки рассылки
+bot.command('stop', async (ctx) => {
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    await ctx.reply('❌ Использование: /stop <broadcast_id>\nПолучить ID можно из уведомлений о рассылке').catch(() => {});
+    return;
+  }
+
+  const broadcastId = args[1];
+  const broadcast = activeBroadcasts.get(broadcastId);
+
+  if (broadcast) {
+    broadcast.stop = true;
+    await ctx.reply(`✅ Команда остановки отправлена для рассылки ${broadcastId}`).catch(() => {});
+  } else {
+    await ctx.reply('❌ Рассылка не найдена').catch(() => {});
+  }
 });
 
 // Главное меню
@@ -816,7 +836,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
     `📊 Найдено ссылок: ${validLinks.length}\n\n` +
     `🛡️ *Защита:*\n` +
     `   ⏱ Задержка: 30-60 мин\n` +
-    `   📊 Лимит/день: ${MAX_JOINS_PER_DAY}\n\n` +
+    `   📊 Перерыв после ${MAX_JOINS_BEFORE_BREAK} чатов: 4 часа\n\n` +
     `⏳ Начинаем...`,
     { parse_mode: 'Markdown' }
   );
@@ -824,6 +844,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
   let joined = 0;
   let failed = 0;
   let needsApproval = 0;
+  let joinsSinceBreak = 0;
 
   for (let i = 0; i < validLinks.length; i++) {
     const join = activeJoins.get(joinId);
@@ -831,6 +852,20 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
       await ctx.reply(`⏹ Остановлено\n✅ Присоединено: ${joined} | ❌ Ошибок: ${failed} | ⏳ Ожидает одобрения: ${needsApproval}`).catch(() => {});
       activeJoins.delete(joinId);
       return;
+    }
+
+    // Проверка перерыва после MAX_JOINS_BEFORE_BREAK (30) чатов
+    if (joinsSinceBreak >= MAX_JOINS_BEFORE_BREAK) {
+      const breakHours = JOIN_BREAK_DURATION / 3600000;
+      await ctx.reply(
+        `⏸ *Перерыв ${breakHours} часа*\n\n` +
+        `После ${MAX_JOINS_BEFORE_BREAK} присоединений - перерыв\n` +
+        `Ожидаем ${breakHours} часов...`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+      await new Promise(r => setTimeout(r, JOIN_BREAK_DURATION));
+      joinsSinceBreak = 0;
+      await ctx.reply(`✅ Перерыв завершён, продолжаем...`).catch(() => {});
     }
 
     // Проверка ночной паузы
@@ -852,13 +887,16 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
 
       if (result.success) {
         joined++;
+        joinsSinceBreak++;
         console.log(`  ✓ Joined successfully`);
       } else if (result.needsApproval) {
         needsApproval++;
         console.log(`  ⏳ Needs approval: ${result.error}`);
+        // Пропускаем чат с needsApproval - не увеличиваем счётчик
       } else {
         failed++;
         console.log(`  ✗ Failed: ${result.error}`);
+        // Пропускаем чат с ошибкой - не увеличиваем счётчик
       }
 
       // Прогресс каждые 3
@@ -1332,8 +1370,9 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     const hours = Math.floor(estimatedMin / 60);
     const mins = estimatedMin % 60;
 
+    // Уведомление о начале рассылки
     await ctx.reply(
-      `🛡️ *Анти-бан Рассылка*\n\n` +
+      `🔔 *Рассылка началась!*\n\n` +
       `📱 Аккаунт: ${acc.name || acc.phone}\n` +
       `📊 Найдено: ${archivedChats.length} чатов\n` +
       `   👥 Групп: ${groups.length}\n` +
@@ -1342,64 +1381,67 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       `   ⏱ Задержка: 8-15 мин (прогрессивная)\n` +
       `   🤖 Имитация человека: ВКЛ\n` +
       `   🔤 Вариация текста: ВКЛ\n` +
-      `   🌙 Ночная пауза: 00:00-08:00\n` +
       `   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n\n` +
       `⏱ Примерное время: ~${hours}ч ${mins}мин\n\n` +
-      `⏳ Начинаем рассылку...`,
+      `⏳ Рассылка по кругу пока не остановите...\n` +
+      `🛑 Для остановки нажмите "⏹ Стоп"`,
       { parse_mode: 'Markdown' }
     );
 
     let sent = 0;
     let failed = 0;
+    let loopCount = 0;
+    let chatIndex = 0;
 
-    for (let i = 0; i < archivedChats.length; i++) {
+    // Бесконечный цикл пока не остановят
+    while (true) {
       const broadcast = activeBroadcasts.get(broadcastId);
       if (broadcast?.stop) {
-        await ctx.reply(`⏹ Остановлено\n✅ ${sent} | ❌ ${failed}`).catch(() => {});
+        await ctx.reply(`⏹ *Рассылка остановлена*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`, { parse_mode: 'Markdown' }).catch(() => {});
         activeBroadcasts.delete(broadcastId);
         return;
       }
 
-      // Проверка ночной паузы
-      if (isNightPause()) {
-        const waitTime = getTimeUntilMorning();
-        const hoursLeft = Math.floor(waitTime / 3600000);
-        console.log(`🌙 Night pause detected. Waiting ${hoursLeft} hours until morning...`);
-        await ctx.reply(
-          `🌙 *Ночная пауза*\n\n` +
-          `Бот приостановлен до 08:00\n` +
-          `Осталось: ~${hoursLeft} ч\n\n` +
-          `Продолжится автоматически утром.`,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-
-        await new Promise(r => setTimeout(r, waitTime));
-      }
-
-      // Проверка дневного лимита
+      // Проверка дневного лимита - ждём до полуночи
       if (acc.sentToday >= MAX_MESSAGES_PER_DAY) {
         await ctx.reply(
           `⚠️ *Достигнут дневной лимит*\n\n` +
           `Отправлено сегодня: ${acc.sentToday}\n` +
           `Максимум: ${MAX_MESSAGES_PER_DAY}\n\n` +
-          `Рассылка приостановлена.`,
+          `⏳ Ожидаем сброса лимита...`,
           { parse_mode: 'Markdown' }
         ).catch(() => {});
-        activeBroadcasts.delete(broadcastId);
-        return;
+
+        // Ждём 1 час и проверяем снова
+        await new Promise(r => setTimeout(r, 60 * 60 * 1000));
+        continue;
       }
 
-      const chat = archivedChats[i];
+      // Если прошли все чаты - начинаем сначала (по кругу)
+      if (chatIndex >= archivedChats.length) {
+        chatIndex = 0;
+        loopCount++;
+        await ctx.reply(
+          `🔄 *Новый круг рассылки #${loopCount + 1}*\n\n` +
+          `✅ Отправлено: ${sent}\n` +
+          `❌ Ошибок: ${failed}\n` +
+          `📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      }
+
+      const chat = archivedChats[chatIndex];
 
       // Проверяем что есть ID чата
       const chatId = String(chat.id?._serialized || chat.id);
       if (!chatId) {
-        console.error(`Chat ${i} has no ID, skipping`);
-        failed++;
+        console.error(`Chat ${chatIndex} has no ID, skipping`);
+        chatIndex++;
         continue;
       }
 
-      console.log(`[${i+1}/${archivedChats.length}] Sending to: ${chat.name || String(chatId)}`);
+      const currentMsgNum = loopCount * archivedChats.length + chatIndex + 1;
+      console.log(`[Круг ${loopCount + 1}, ${chatIndex + 1}/${archivedChats.length}] Sending to: ${chat.name || String(chatId)}`);
 
       try {
         // Используем прогрессивную задержку
@@ -1410,7 +1452,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
           acc.client,
           chatId,
           text,
-          i,
+          currentMsgNum,
           archivedChats.length,
           true,
           true,
@@ -1425,17 +1467,16 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
           failed++;
           acc.failedToday++;
           console.log(`  ✗ Failed! Total failed: ${failed}`);
+          // Пропускаем чат с ошибкой - не пауза
         }
 
-        // Обновляем прогресс
-        if (i % 3 === 0 || i === archivedChats.length - 1) {
-          const remaining = archivedChats.length - (i + 1);
-          const remainingMs = remaining * MIN_DELAY;
+        // Обновляем прогресс каждые 3 сообщения
+        if (currentMsgNum % 3 === 0) {
           await ctx.reply(
-            `📊 ${i + 1}/${archivedChats.length}\n` +
+            `📊 Круг ${loopCount + 1} | Сообщение ${chatIndex + 1}/${archivedChats.length}\n` +
             `✅ ${sent} | ❌ ${failed}\n` +
             `📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}\n` +
-            `⏳ Осталось ~${Math.ceil(remainingMs / 60000)} мин`,
+            `🛑 Стоп: /stop_${broadcastId}`,
           ).catch(() => {});
         }
 
@@ -1443,25 +1484,16 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
         console.error('Send error:', error);
         failed++;
         acc.failedToday++;
+        // Пропускаем чат с ошибкой
       }
+
+      chatIndex++;
 
       // Задержка между сообщениями (прогрессивная)
-      if (i < archivedChats.length - 1) {
-        const delay = getProgressiveDelay(sent, archivedChats.length);
-        console.log(`Waiting ${Math.round(delay / 60000)} minutes before next message...`);
-        await new Promise(r => setTimeout(r, delay));
-      }
+      const delay = getProgressiveDelay(sent, archivedChats.length);
+      console.log(`Waiting ${Math.round(delay / 60000)} minutes before next message...`);
+      await new Promise(r => setTimeout(r, delay));
     }
-
-    await ctx.reply(
-      `🏁 *Рассылка завершена*\n\n` +
-      `✅ Отправлено: ${sent}\n` +
-      `❌ Ошибок: ${failed}\n\n` +
-      `📊 Всего за сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => {});
-
-    activeBroadcasts.delete(broadcastId);
 
   } catch (error) {
     console.error('Broadcast error:', error);
