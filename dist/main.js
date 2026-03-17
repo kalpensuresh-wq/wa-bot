@@ -299,7 +299,8 @@ const accountsMenu = (accountId) => {
                 ]);
             });
         }
-        buttons.push([telegraf_1.Markup.button.callback('➕ Добавить номер', 'add_account')]);
+        buttons.push([telegraf_1.Markup.button.callback('📷 QR-код', 'add_qr')]);
+        buttons.push([telegraf_1.Markup.button.callback('🔢 Код подтверждения', 'add_phone')]);
         buttons.push([telegraf_1.Markup.button.callback('◀️ Назад', 'main')]);
     }
     return telegraf_1.Markup.inlineKeyboard(buttons);
@@ -941,11 +942,11 @@ bot.on('text', async (ctx) => {
                 await ctx.reply('❌ Неверный формат номера. Введите в формате +79991234567');
                 return;
             }
-            await addNewAccount(ctx, cleanPhone);
+            await addNewAccount(ctx, cleanPhone, 'qr');
             userStates.delete(ctx.from.id);
             return;
         }
-        // Авторизация по номеру телефона
+        // Авторизация по номеру телефона (код подтверждения)
         if (state.action === 'waiting_phone_pairing') {
             let phone = ctx.message.text.trim();
             // Убираем все кроме цифр
@@ -965,7 +966,7 @@ bot.on('text', async (ctx) => {
                 await ctx.reply('❌ Неверный формат номера.\nВведите 10 цифр: 7771234567');
                 return;
             }
-            await addNewAccount(ctx, cleanPhone);
+            await addNewAccount(ctx, cleanPhone, 'pairing');
             userStates.delete(ctx.from.id);
             return;
         }
@@ -1022,8 +1023,8 @@ bot.on('text', async (ctx) => {
     }
 });
 // === ФУНКЦИИ ===
-// Создание аккаунта - используем только QR-код (надежнее)
-async function addNewAccount(ctx, phone) {
+// Создание аккаунта с поддержкой двух методов: QR-код или код подтверждения
+async function addNewAccount(ctx, phone, authMethod = 'qr') {
     const accountId = `wa_${phone.replace(/\+/g, '')}`;
     if (waAccounts.has(accountId)) {
         const existing = waAccounts.get(accountId);
@@ -1106,12 +1107,23 @@ async function addNewAccount(ctx, phone) {
         failedToday: 0,
     });
     let qrSent = false;
+    let pairingCodeSent = false;
     // Обработчик QR кода
     client.on('qr', async (qr) => {
-        console.log('QR received for', accountId);
+        console.log('QR received for', accountId, 'authMethod:', authMethod);
         const acc = waAccounts.get(accountId);
         if (acc?.status === 'connected')
             return;
+        // Если выбран метод pairing code - игнорируем QR код
+        if (authMethod === 'pairing') {
+            if (!pairingCodeSent) {
+                // Попробуем получить код подтверждения
+                await requestPairingCode(ctx, client, phone, accountId);
+                pairingCodeSent = true;
+            }
+            return;
+        }
+        // QR метод - отправляем код
         if (!qrSent) {
             qrSent = true;
             try {
@@ -1137,6 +1149,11 @@ async function addNewAccount(ctx, phone) {
     });
     client.on('ready', async () => {
         console.log('Client ready for', accountId);
+        // Если выбран pairing code метод - запрашиваем код после готовности
+        if (authMethod === 'pairing' && !pairingCodeSent) {
+            await requestPairingCode(ctx, client, phone, accountId);
+            return;
+        }
         const acc = waAccounts.get(accountId);
         if (acc) {
             acc.status = 'connected';
@@ -1145,6 +1162,39 @@ async function addNewAccount(ctx, phone) {
             `• Настроить текст рассылки в "Аккаунты"\n` +
             `• Запустить рассылку в архивные чаты`, { parse_mode: 'Markdown' }).catch(() => { });
     });
+    // Функция запроса кода подтверждения (pairing code)
+    async function requestPairingCode(ctx, client, phone, accountId) {
+        try {
+            // Форматируем номер телефона - убираем всё кроме цифр
+            const phoneNumber = phone.replace(/[^0-9]/g, '');
+            await ctx.reply('⏳ *Запрос кода подтверждения...*\n\n' +
+                'Это может занять до 30 секунд...', { parse_mode: 'Markdown' }).catch(() => { });
+            // Запрашиваем код подтверждения у WhatsApp
+            // @ts-ignore - метод существует в whatsapp-web.js
+            const pairingCode = await client.requestPairingCode(phoneNumber);
+            console.log('Pairing code received:', pairingCode);
+            // Форматируем код (добавляем дефис если нужно)
+            const formattedCode = pairingCode.length === 8
+                ? pairingCode.slice(0, 4) + '-' + pairingCode.slice(4)
+                : pairingCode;
+            await ctx.reply('🔢 *КОД ПОДТВЕРЖДЕНИЯ*\n\n' +
+                `\`${formattedCode}\`\n\n` +
+                '📱 *Как подтвердить:*\n\n' +
+                '1. Откройте WhatsApp на телефоне\n' +
+                '2. Нажмите Настройки (или меню) → Связанные устройства\n' +
+                '3. Нажмите "Подключить устройство"\n' +
+                '4. Выберите "Подключить по номеру телефона"\n' +
+                '5. Введите код: ' + formattedCode + '\n\n' +
+                '⏰ Код действителен ~60 секунд', { parse_mode: 'Markdown' }).catch(() => { });
+        }
+        catch (error) {
+            console.error('Pairing code error:', error);
+            // Если не удалось получить код - предлагаем QR
+            await ctx.reply('⚠️ *Не удалось получить код подтверждения*\n\n' +
+                'Ошибка: ' + (error.message || 'Неизвестная ошибка') + '\n\n' +
+                'Попробуйте использовать QR-код вместо этого.', { parse_mode: 'Markdown' }).catch(() => { });
+        }
+    }
     client.on('auth_failure', async (msg) => {
         console.log('Auth failure for', accountId, msg);
         const acc = waAccounts.get(accountId);
