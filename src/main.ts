@@ -1,5 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
-import { Client, LocalAuth } from 'whatsapp-web.js';
+import { Client, LocalAuth, RemoteAuth } from 'whatsapp-web.js';
+import { MongoStore } from 'wwebjs-mongo';
+import mongoose from 'mongoose';
 import * as QRCode from 'qrcode';
 import * as fs from 'fs';
 import * as express from 'express';
@@ -582,8 +584,10 @@ bot.action('add_phone', async (ctx) => {
 
   await ctx.editMessageText(
     '🔢 *Подключение по номеру*\n\n' +
-    'Введите номер телефона в формате:\n' +
-    '+79991234567\n\n' +
+    '📱 *Казахстан (по умолчанию)*\n' +
+    'Введите номер в формате:\n' +
+    '+7 777 1234567\n' +
+    'или просто: 7771234567\n\n' +
     '⚠️ *Важно:*\n' +
     '- WhatsApp должен быть открыт на телефоне\n' +
     '- Иногда требуется подтверждение\n' +
@@ -1112,10 +1116,23 @@ bot.on('text', async (ctx) => {
 
     // Пароль (pairing code) авторизация
     if (state.action === 'waiting_phone_pairing') {
-      const phone = ctx.message.text.trim();
-      const cleanPhone = phone.replace(/[^0-9+]/g, '');
-      if (cleanPhone.length < 10) {
-        await ctx.reply('❌ Неверный формат номера. Введите в формате +79991234567');
+      let phone = ctx.message.text.trim();
+
+      // Убираем все кроме цифр
+      let cleanPhone = phone.replace(/[^0-9]/g, '');
+
+      // Если 10 цифр (без кода страны) - добавляем +7 (Казахстан)
+      if (cleanPhone.length === 10 && /^[0-9]/.test(cleanPhone)) {
+        cleanPhone = '+7' + cleanPhone;
+      } else if (cleanPhone.length === 11 && cleanPhone.startsWith('8')) {
+        // Если начинается с 8, заменяем на +7
+        cleanPhone = '+7' + cleanPhone.substring(1);
+      } else if (!cleanPhone.startsWith('+')) {
+        cleanPhone = '+' + cleanPhone;
+      }
+
+      if (cleanPhone.length < 11) {
+        await ctx.reply('❌ Неверный формат номера.\nВведите 10 цифр: 7771234567');
         return;
       }
 
@@ -1208,17 +1225,34 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
 
   await ctx.reply('⏳ Создание сессии...\nЭто может занять 10-30 секунд').catch(() => {});
 
-  const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
-  if (!fs.existsSync(sessionsPath)) {
-    fs.mkdirSync(sessionsPath, { recursive: true });
+  // Проверяем наличие MongoDB для RemoteAuth
+  const mongoUri = process.env.MONGO_URI;
+
+  let authStrategy;
+  if (mongoUri) {
+    // Используем RemoteAuth с MongoDB для сохранения сессии
+    console.log('Using RemoteAuth with MongoDB');
+    authStrategy = new RemoteAuth({
+      store: undefined, // Will be set after mongoose connects
+      backupSyncIntervalMs: 300000, // 5 minutes
+      clientId: accountId,
+    });
+  } else {
+    // Fallback на LocalAuth если нет MongoDB
+    console.log('MongoDB not configured, using LocalAuth');
+    const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
+    if (!fs.existsSync(sessionsPath)) {
+      fs.mkdirSync(sessionsPath, { recursive: true });
+    }
+    authStrategy = new LocalAuth({
+      clientId: accountId,
+      dataPath: sessionsPath,
+    });
   }
 
   // Настройки клиента
   const clientOptions: any = {
-    authStrategy: new LocalAuth({
-      clientId: accountId,
-      dataPath: sessionsPath,
-    }),
+    authStrategy,
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
@@ -1239,10 +1273,7 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
   if (authType === 'pairing') {
     // WhatsApp Web теперь поддерживает pairing code
     // Используем метод requestPairingCode
-    clientOptions.authStrategy = new LocalAuth({
-      clientId: accountId,
-      dataPath: sessionsPath,
-    });
+    // (authStrategy уже настроен выше)
   }
 
   const client = new Client(clientOptions);
@@ -1670,11 +1701,32 @@ function startChromeAutoRestart() {
   }, CHROME_RESTART_INTERVAL);
 }
 
+// Подключение к MongoDB для RemoteAuth
+async function connectMongoDB() {
+  const mongoUri = process.env.MONGO_URI;
+  if (mongoUri) {
+    try {
+      await mongoose.connect(mongoUri);
+      console.log('✅ MongoDB connected for session persistence');
+      return true;
+    } catch (e) {
+      console.error('❌ MongoDB connection failed:', e);
+      return false;
+    }
+  } else {
+    console.log('⚠️ MONGO_URI not set, sessions will not persist after restart');
+    return false;
+  }
+}
+
 // Запуск
 async function main() {
   console.log('🚀 Starting bot...');
   console.log('Admin IDs:', ADMIN_IDS);
   console.log('Accounts loaded:', waAccounts.size);
+
+  // Подключаем MongoDB для сохранения сессий
+  await connectMongoDB();
 
   // Настраиваем меню
   await setupBotMenu();
