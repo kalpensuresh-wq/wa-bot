@@ -1125,12 +1125,12 @@ bot.on('text', async (ctx) => {
         return;
       }
 
-      await addNewAccount(ctx, cleanPhone, 'qr');
+      await addNewAccount(ctx, cleanPhone);
       userStates.delete(ctx.from!.id);
       return;
     }
 
-    // Пароль (pairing code) авторизация
+    // Авторизация по номеру телефона
     if (state.action === 'waiting_phone_pairing') {
       let phone = ctx.message.text.trim();
 
@@ -1152,7 +1152,7 @@ bot.on('text', async (ctx) => {
         return;
       }
 
-      await addNewAccount(ctx, cleanPhone, 'pairing');
+      await addNewAccount(ctx, cleanPhone);
       userStates.delete(ctx.from!.id);
       return;
     }
@@ -1224,8 +1224,8 @@ bot.on('text', async (ctx) => {
 
 // === ФУНКЦИИ ===
 
-// Создание аккаунта с поддержкой QR и pairing code
-async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing' = 'qr') {
+// Создание аккаунта - используем только QR-код (надежнее)
+async function addNewAccount(ctx: any, phone: string) {
   const accountId = `wa_${phone.replace(/\+/g, '')}`;
 
   if (waAccounts.has(accountId)) {
@@ -1244,11 +1244,12 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
   let authStrategy;
 
   // Используем RemoteAuth только если MongoDB подключена
+  // ВАЖНО: Для wwebjs-mongo нужно передать mongoose экземпляр, а не client
   if (mongoUri && mongoConnected && mongoose.connection.readyState === 1) {
     console.log('Using RemoteAuth with MongoDB');
     try {
-      // Создаем MongoStore с использованием mongoose client
-      const store = new MongoStore({ client: mongoose.connection.getClient() });
+      // Создаем MongoStore с передачей mongoose экземпляра
+      const store = new MongoStore({ mongoose });
       authStrategy = new RemoteAuth({
         store: store,
         backupSyncIntervalMs: 300000, // 5 минут
@@ -1297,13 +1298,6 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
     },
   };
 
-  // Если pairing code - пробуем использовать
-  if (authType === 'pairing') {
-    // WhatsApp Web теперь поддерживает pairing code
-    // Используем метод requestPairingCode
-    // (authStrategy уже настроен выше)
-  }
-
   const client = new Client(clientOptions);
 
   waAccounts.set(accountId, {
@@ -1318,7 +1312,6 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
   });
 
   let qrSent = false;
-  let pairingCodeRequested = false;
 
   // Обработчик QR кода
   client.on('qr', async (qr) => {
@@ -1326,38 +1319,31 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
     const acc = waAccounts.get(accountId);
     if (acc?.status === 'connected') return;
 
-    // Если запрашивали pairing code, но получили QR - значит pairing не сработал
-    if (authType === 'pairing' && !qrSent) {
-      await ctx.reply(
-        '⚠️ *Pairing code не был отправлен*\n\n' +
-        'WhatsApp отправил QR-код вместо кода подтверждения.\n' +
-        'Отсканируйте QR-код для подключения.',
-        { parse_mode: 'Markdown' }
-      ).catch(() => {});
-    }
-
     if (!qrSent) {
       qrSent = true;
       try {
         const qrDataUrl = await QRCode.toDataURL(qr);
         const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
         const buffer = Buffer.from(base64Data, 'base64');
+
+        // Отправляем QR код с четкими инструкциями
+        await ctx.reply(
+          '📱 *Подключение WhatsApp*\n\n' +
+          '1. Откройте WhatsApp на телефоне\n' +
+          '2. Нажмите Настройки → Связанные устройства\n' +
+          '3. Нажмите "Подключить устройство"\n' +
+          '4. Отсканируйте QR-код ниже\n\n' +
+          '⏰ QR-код действителен ~60 секунд',
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+
         await ctx.replyWithPhoto({ source: buffer }, {
-          caption: '📱 *Отсканируйте QR-код*\n\nWhatsApp → Настройки → Связанные устройства',
+          caption: '📱 *Отсканируйте этот QR-код*',
           parse_mode: 'Markdown'
         });
       } catch (e) {
         console.error('QR send error:', e);
       }
-    }
-  });
-
-  // Попытка запросить pairing code после инициализации
-  client.on('loading_screens', async () => {
-    if (authType === 'pairing' && !pairingCodeRequested) {
-      pairingCodeRequested = true;
-      // Даем странице загрузиться
-      await new Promise(r => setTimeout(r, 3000));
     }
   });
 
@@ -1368,42 +1354,10 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
       acc.status = 'connected';
     }
 
-    // Если был запрошен pairing code - пробуем отправить
-    if (authType === 'pairing') {
-      try {
-        // Форматируем номер для pairing
-        const phoneNumber = phone.replace(/[^0-9]/g, '');
-        await ctx.reply('⏳ Попытка получить код подтверждения...').catch(() => {});
-
-        // Метод существует в whatsapp-web.js
-        // @ts-ignore
-        const pairingCode = await client.requestPairingCode(phoneNumber);
-        console.log('Pairing code received:', pairingCode);
-
-        await ctx.reply(
-          `🔢 *Код подтверждения:*\n\n` +
-          `${pairingCode}\n\n` +
-          `Введите этот код в WhatsApp на телефоне:\n` +
-          `WhatsApp → Настройки → Связанные устройства → Подключить устройство`,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-
-        // Не меняем статус на connected сразу, ждем подтверждения
-        return;
-
-      } catch (error: any) {
-        console.error('Pairing code error:', error);
-        await ctx.reply(
-          '⚠️ *Не удалось получить код подтверждения*\n\n' +
-          'Ошибка: ' + (error.message || 'Неизвестная ошибка') + '\n\n' +
-          'Подключение через QR-код...',
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-      }
-    }
-
     await ctx.reply(
-      `✅ *Подключено!*\n\n📞 Телефон: ${phone}\n\nТеперь настройте текст для рассылки в разделе "Аккаунты"`,
+      `✅ *WhatsApp подключен!*\n\n📞 Номер: ${phone}\n\nТеперь вы можете:\n` +
+      `• Настроить текст рассылки в "Аккаунты"\n` +
+      `• Запустить рассылку в архивные чаты`,
       { parse_mode: 'Markdown' }
     ).catch(() => {});
   });
