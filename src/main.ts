@@ -329,12 +329,28 @@ const settingsMenu = () => Markup.inlineKeyboard([
   [Markup.button.callback('◀️ Назад', 'main')],
 ]);
 
-// Middleware
+// Admin check middleware - FIRST to block non-admins
 bot.use(async (ctx, next) => {
   if (ctx.from && !isAdmin(ctx.from.id)) {
     return ctx.reply('⛔ Нет доступа').catch(() => {});
   }
   await next();
+});
+
+// Middleware for debugging
+bot.use(async (ctx, next) => {
+  // Log all callback queries
+  if (ctx.callbackQuery) {
+    console.log('[DEBUG] CallbackQuery:', JSON.stringify({
+      data: ctx.callbackQuery.data,
+      from: ctx.from?.id,
+      chat: ctx.chat?.id
+    }));
+  }
+  await next().catch(err => {
+    console.error('[DEBUG] Error in handler:', err);
+    ctx.reply('❌ Произошла ошибка: ' + err.message).catch(() => {});
+  });
 });
 
 // Команда /start
@@ -377,6 +393,8 @@ bot.action('main', async (ctx) => {
 // === УПРАВЛЕНИЕ АККАУНТАМИ ===
 
 bot.action('accounts', async (ctx) => {
+  console.log('[DEBUG] accounts callback triggered');
+  console.log('[DEBUG] Total accounts:', waAccounts.size);
   await ctx.answerCbQuery().catch(() => {});
 
   let text = '📱 *Мои аккаунты*\n\n';
@@ -635,6 +653,7 @@ bot.action(/^view_chats_(.+)$/, async (ctx) => {
 // === РАССЫЛКА ===
 
 bot.action('broadcast_menu', async (ctx) => {
+  console.log('[DEBUG] broadcast_menu callback triggered');
   await ctx.answerCbQuery().catch(() => {});
 
   const enabledAccounts = [...waAccounts.values()].filter(a => a.status === 'connected' && a.enabled);
@@ -664,8 +683,12 @@ bot.action('broadcast_menu', async (ctx) => {
 
 // Выбрали аккаунт для рассылки
 bot.action(/^broadcast_acc_(.+)$/, async (ctx) => {
+  console.log('[DEBUG] broadcast_acc_ callback triggered');
+  console.log('[DEBUG] match:', ctx.match);
   await ctx.answerCbQuery().catch(() => {});
   const accountId = ctx.match![1];
+  console.log('[DEBUG] accountId:', accountId);
+  console.log('[DEBUG] Available accounts:', [...waAccounts.keys()]);
   const acc = waAccounts.get(accountId);
 
   if (!acc || acc.status !== 'connected') {
