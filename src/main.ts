@@ -4,7 +4,7 @@ import { MongoStore } from 'wwebjs-mongo';
 import mongoose from 'mongoose';
 import * as QRCode from 'qrcode';
 import * as fs from 'fs';
-import * as express from 'express';
+import express from 'express';
 import 'dotenv/config';
 
 // === EXPRESS СЕРВЕР ДЛЯ HEALTH CHECK ===
