@@ -369,9 +369,9 @@ bot.use(async (ctx, next) => {
 // Middleware for debugging
 bot.use(async (ctx, next) => {
   // Log all callback queries
-  if (ctx.callbackQuery) {
+  if (ctx.callbackQuery && 'data' in ctx.callbackQuery) {
     console.log('[DEBUG] CallbackQuery:', JSON.stringify({
-      data: ctx.callbackQuery.data,
+      data: (ctx.callbackQuery as any).data,
       from: ctx.from?.id,
       chat: ctx.chat?.id
     }));
