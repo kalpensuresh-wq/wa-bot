@@ -2,7 +2,34 @@ import { Telegraf, Markup } from 'telegraf';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 import * as QRCode from 'qrcode';
 import * as fs from 'fs';
+import * as express from 'express';
 import 'dotenv/config';
+
+// === EXPRESS СЕРВЕР ДЛЯ HEALTH CHECK ===
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/health', (req, res) => {
+  const connectedAccounts = [...waAccounts.values()].filter(a => a.status === 'connected').length;
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    accounts: {
+      total: waAccounts.size,
+      connected: connectedAccounts
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/', (req, res) => {
+  res.send('WhatsApp Bot Running');
+});
+
+// Запуск Express сервера
+app.listen(PORT, () => {
+  console.log(`🌐 Health check server running on port ${PORT}`);
+});
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
 
@@ -359,6 +386,38 @@ bot.start(async (ctx) => {
     parse_mode: 'Markdown',
     ...mainMenu()
   });
+});
+
+// Команда /status - показать статус с эмодзи
+bot.command('status', async (ctx) => {
+  const connected = [...waAccounts.values()].filter(a => a.status === 'connected').length;
+  const enabled = [...waAccounts.values()].filter(a => a.enabled).length;
+  const totalSent = [...waAccounts.values()].reduce((sum, a) => sum + a.sentToday, 0);
+
+  // Определяем статус
+  let statusEmoji = '🟢';
+  let statusText = 'Работает';
+
+  if (connected === 0) {
+    statusEmoji = '🔴';
+    statusText = 'Нет подключений';
+  } else if (isBroadcasting) {
+    statusEmoji = '🟡';
+    statusText = 'Рассылка активна';
+  }
+
+  const uptime = Math.floor(process.uptime() / 60); // минуты
+
+  await ctx.reply(
+    `${statusEmoji} *Статус бота*\n\n` +
+    `📊 Статус: ${statusText}\n` +
+    `🖥 Аккаунтов: ${connected}/${waAccounts.size} подключено\n` +
+    `✅ Включено для рассылки: ${enabled}\n` +
+    `📤 Отправлено сегодня: ${totalSent}\n` +
+    `⏱ Uptime: ${uptime} минут\n\n` +
+    `🌐 Health: /health (в браузере)`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // Команда /stop для остановки рассылки
@@ -1379,6 +1438,9 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     return ctx.reply('❌ Аккаунт не подключен').catch(() => {});
   }
 
+  // Устанавливаем флаг что идёт рассылка
+  isBroadcasting = true;
+
   if (!acc.enabled) {
     return ctx.reply('❌ Этот аккаунт выключен для рассылки').catch(() => {});
   }
@@ -1445,6 +1507,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     while (true) {
       const broadcast = activeBroadcasts.get(broadcastId);
       if (broadcast?.stop) {
+        isBroadcasting = false;
         await ctx.reply(`⏹ *Рассылка остановлена*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`, { parse_mode: 'Markdown' }).catch(() => {});
         activeBroadcasts.delete(broadcastId);
         return;
@@ -1544,6 +1607,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     }
 
   } catch (error) {
+    isBroadcasting = false;
     console.error('Broadcast error:', error);
     await ctx.reply(`❌ Ошибка: ${(error as Error).message}`).catch(() => {});
   }
@@ -1559,11 +1623,64 @@ bot.catch((err, ctx) => {
   }
 });
 
+// === НАСТРОЙКА МЕНЮ БОТА ===
+async function setupBotMenu() {
+  try {
+    await bot.telegram.setMyCommands([
+      { command: 'start', description: 'Главное меню' },
+      { command: 'status', description: 'Статус бота' },
+      { command: 'broadcast', description: 'Начать рассылку' },
+      { command: 'stop', description: 'Остановить рассылку' },
+      { command: 'accounts', description: 'Управление аккаунтами' }
+    ]);
+    console.log('✅ Menu commands set');
+  } catch (e) {
+    console.error('Error setting menu:', e);
+  }
+}
+
+// === АВТО-ПЕРЕЗАПУСК CHROME (каждые 6 часов) ===
+const CHROME_RESTART_INTERVAL = 6 * 60 * 60 * 1000; // 6 часов
+let isBroadcasting = false;
+
+function startChromeAutoRestart() {
+  setInterval(async () => {
+    if (isBroadcasting) {
+      console.log('⚠️ Broadcast in progress, postponing Chrome restart');
+      return;
+    }
+
+    console.log('🔄 Scheduled Chrome restart...');
+
+    // Перезапускаем все подключенные аккаунты
+    for (const [id, acc] of waAccounts) {
+      if (acc.status === 'connected') {
+        try {
+          console.log(`  Restarting Chrome for ${id}...`);
+          await acc.client.destroy();
+
+          // Новая инициализация
+          acc.client.initialize();
+          console.log(`  ✅ Chrome restarted for ${id}`);
+        } catch (e) {
+          console.error(`  ❌ Failed to restart Chrome for ${id}:`, e);
+        }
+      }
+    }
+  }, CHROME_RESTART_INTERVAL);
+}
+
 // Запуск
 async function main() {
   console.log('🚀 Starting bot...');
   console.log('Admin IDs:', ADMIN_IDS);
   console.log('Accounts loaded:', waAccounts.size);
+
+  // Настраиваем меню
+  await setupBotMenu();
+
+  // Запускаем авто-перезапуск Chrome
+  startChromeAutoRestart();
 
   await bot.launch();
   console.log('✅ Bot started');
