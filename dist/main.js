@@ -299,8 +299,9 @@ const accountsMenu = (accountId) => {
                 ]);
             });
         }
-        buttons.push([telegraf_1.Markup.button.callback('📷 QR-код', 'add_qr')]);
-        buttons.push([telegraf_1.Markup.button.callback('🔢 Код подтверждения', 'add_phone')]);
+        buttons.push([telegraf_1.Markup.button.callback('📷 QR-код (рекомендуется)', 'add_qr')]);
+        // Кнопка временно отключена - pairing code не работает из-за изменений в WhatsApp
+        // buttons.push([Markup.button.callback('🔢 Код подтверждения', 'add_phone')]);
         buttons.push([telegraf_1.Markup.button.callback('◀️ Назад', 'main')]);
     }
     return telegraf_1.Markup.inlineKeyboard(buttons);
@@ -486,20 +487,18 @@ bot.action(/^toggle_(.+)$/, async (ctx) => {
         ...accountsMenu(accountId)
     }).catch(() => { });
 });
-// Добавить аккаунт - выбор способа авторизации
+// Добавить аккаунт - только QR-код (pairing code временно не работает)
 bot.action('add_account', async (ctx) => {
     await ctx.answerCbQuery().catch(() => { });
     await ctx.editMessageText('📱 *Добавление аккаунта*\n\n' +
-        'Выберите способ авторизации:\n\n' +
-        '📷 *QR-код* - сканировать код в WhatsApp\n' +
+        '📷 *Подключение через QR-код*\n' +
         '   ✅ Работает стабильно\n\n' +
-        '🔢 *По номеру* - ввод телефона\n' +
-        '   ⚠️ Может не работать', {
+        '⚠️ *Код подтверждения временно недоступен*\n' +
+        '   WhatsApp изменил интерфейс, ожидаем исправления', {
         parse_mode: 'Markdown',
         reply_markup: {
             inline_keyboard: [
                 [telegraf_1.Markup.button.callback('📷 QR-код', 'add_qr')],
-                [telegraf_1.Markup.button.callback('🔢 По номеру', 'add_phone')],
                 [telegraf_1.Markup.button.callback('❌ Отмена', 'accounts')]
             ]
         }
@@ -517,23 +516,20 @@ bot.action('add_qr', async (ctx) => {
         ...telegraf_1.Markup.inlineKeyboard([[telegraf_1.Markup.button.callback('❌ Отмена', 'add_account')]])
     }).catch(() => { });
 });
-// Добавить через номер (pairing code)
-bot.action('add_phone', async (ctx) => {
-    await ctx.answerCbQuery().catch(() => { });
-    userStates.set(ctx.from.id, { action: 'waiting_phone_pairing' });
-    await ctx.editMessageText('🔢 *Подключение по номеру*\n\n' +
-        '📱 *Казахстан (по умолчанию)*\n' +
-        'Введите номер в формате:\n' +
-        '+7 777 1234567\n' +
-        'или просто: 7771234567\n\n' +
-        '⚠️ *Важно:*\n' +
-        '- WhatsApp должен быть открыт на телефоне\n' +
-        '- Иногда требуется подтверждение\n' +
-        '- Может не работать если WhatsApp заблокировал', {
-        parse_mode: 'Markdown',
-        ...telegraf_1.Markup.inlineKeyboard([[telegraf_1.Markup.button.callback('❌ Отмена', 'add_account')]])
-    }).catch(() => { });
-});
+// Добавить через номер (pairing code) - ВРЕМЕННО ОТКЛЮЧЕНО
+// bot.action('add_phone', async (ctx) => {
+//   await ctx.answerCbQuery().catch(() => {});
+//   userStates.set(ctx.from!.id, { action: 'waiting_phone_pairing' });
+//   await ctx.editMessageText(
+//     '🔢 *Подключение по номеру*\n\n' +
+//     '⚠️ Временно недоступно\n' +
+//     'Используйте QR-код',
+//     {
+//       parse_mode: 'Markdown',
+//       ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'add_account')]])
+//     }
+//   ).catch(() => {});
+// });
 // Отвязать аккаунт
 bot.action(/^unbind_(.+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => { });
