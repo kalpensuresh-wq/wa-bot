@@ -7,6 +7,22 @@ import * as fs from 'fs';
 import express from 'express';
 import 'dotenv/config';
 
+// === ПОДКЛЮЧЕНИЕ К MONGODB ===
+const mongoUri = process.env.MONGO_URI;
+let mongoConnected = false;
+
+if (mongoUri) {
+  mongoose.connect(mongoUri)
+    .then(() => {
+      mongoConnected = true;
+      console.log('✅ MongoDB подключена');
+    })
+    .catch((err) => {
+      console.error('❌ Ошибка подключения к MongoDB:', err);
+      mongoConnected = false;
+    });
+}
+
 // === EXPRESS СЕРВЕР ДЛЯ HEALTH CHECK ===
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1225,26 +1241,38 @@ async function addNewAccount(ctx: any, phone: string, authType: 'qr' | 'pairing'
 
   await ctx.reply('⏳ Создание сессии...\nЭто может занять 10-30 секунд').catch(() => {});
 
-  // Проверяем наличие MongoDB для RemoteAuth
-  const mongoUri = process.env.MONGO_URI;
-
   let authStrategy;
-  if (mongoUri) {
-    // Используем RemoteAuth с MongoDB для сохранения сессии
+
+  // Используем RemoteAuth только если MongoDB подключена
+  if (mongoUri && mongoConnected && mongoose.connection.readyState === 1) {
     console.log('Using RemoteAuth with MongoDB');
-    authStrategy = new RemoteAuth({
-      store: undefined, // Will be set after mongoose connects
-      backupSyncIntervalMs: 300000, // 5 minutes
-      clientId: accountId,
-    });
+    try {
+      // Создаем MongoStore с использованием mongoose client
+      const store = new MongoStore({ client: mongoose.connection.getClient() });
+      authStrategy = new RemoteAuth({
+        store: store,
+        backupSyncIntervalMs: 300000, // 5 минут
+        clientId: accountId,
+      });
+      console.log('RemoteAuth created successfully with MongoStore');
+    } catch (e) {
+      console.error('Failed to create RemoteAuth:', e);
+      // Fallback to LocalAuth
+      authStrategy = createLocalAuth(accountId);
+    }
   } else {
     // Fallback на LocalAuth если нет MongoDB
-    console.log('MongoDB not configured, using LocalAuth');
+    console.log('MongoDB not available, using LocalAuth');
+    authStrategy = createLocalAuth(accountId);
+  }
+
+  // Функция создания LocalAuth
+  function createLocalAuth(accountId: string) {
     const sessionsPath = process.env.WA_SESSIONS_PATH || './wa-sessions';
     if (!fs.existsSync(sessionsPath)) {
       fs.mkdirSync(sessionsPath, { recursive: true });
     }
-    authStrategy = new LocalAuth({
+    return new LocalAuth({
       clientId: accountId,
       dataPath: sessionsPath,
     });
