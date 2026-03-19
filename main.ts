@@ -1051,15 +1051,20 @@ bot.on('document', async (ctx) => {
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
 
     await new Promise<void>((resolve, reject) => {
-      https.get(fileUrl, (response) => {
+      const request = https.get(fileUrl, (response) => {
         if (response.statusCode === 200) {
           const fileStream = fs.createWriteStream(filePath);
           response.pipe(fileStream);
-          fileStream.on('finish', () => fileStream.close(resolve));
+          fileStream.on('finish', () => {
+            fileStream.close();
+            resolve();
+          });
+          fileStream.on('error', reject);
         } else {
           reject(new Error(`HTTP ${response.statusCode}`));
         }
-      }).on('error', reject);
+      });
+      request.on('error', reject);
     });
 
     // Парсим файл
