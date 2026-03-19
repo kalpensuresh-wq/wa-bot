@@ -350,9 +350,9 @@ function addLinksToPool(links: string[]): { added: number; duplicates: number } 
   }
 
   // Получаем все подключенные аккаунты
-  const connectedAccounts = [...waAccounts.values()]
-    .filter(a => a.status === 'connected')
-    .map((_, id) => id);
+  const connectedAccounts = [...waAccounts.entries()]
+    .filter(([_, a]) => a.status === 'connected')
+    .map(([id, _]) => id);
 
   if (connectedAccounts.length === 0) {
     return { added: 0, duplicates: 0 };
@@ -1040,15 +1040,27 @@ bot.on('document', async (ctx) => {
   try {
     await safeReply(ctx, `📥 Получен файл: ${fileName}\n⏳ Парсинг ссылок...`);
 
-    // Скачиваем файл
+    // Скачиваем файл через Telegram API
     const tempDir = '/tmp/wa-bot-uploads';
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
 
     const filePath = `${tempDir}/${Date.now()}_${fileName}`;
-    const dest = await ctx.telegram.downloadFile(doc.file_id, tempDir);
-    fs.renameSync(dest, filePath);
+    const fileInfo = await ctx.telegram.getFile(doc.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
+
+    await new Promise<void>((resolve, reject) => {
+      https.get(fileUrl, (response) => {
+        if (response.statusCode === 200) {
+          const fileStream = fs.createWriteStream(filePath);
+          response.pipe(fileStream);
+          fileStream.on('finish', () => fileStream.close(resolve));
+        } else {
+          reject(new Error(`HTTP ${response.statusCode}`));
+        }
+      }).on('error', reject);
+    });
 
     // Парсим файл
     const links = await parseFile(filePath);
