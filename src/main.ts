@@ -2,8 +2,13 @@ import { Telegraf, Markup } from 'telegraf';
 import { Client, LocalAuth } from 'whatsapp-web.js';
 import * as QRCode from 'qrcode';
 import * as fs from 'fs';
+import * as path from 'path';
+import * as https from 'https';
+import * as http from 'http';
+import { URL } from 'url';
 import express from 'express';
 import 'dotenv/config';
+import AdmZip from 'adm-zip';
 
 // === EXPRESS СЕРВЕР ДЛЯ HEALTH CHECK ===
 const app = express();
@@ -103,6 +108,263 @@ const activePendingProcessor = new Map<string, {
   approved: number;
   rejected: number;
 }>();
+
+// === СИСТЕМА ПЕРСИСТЕНТНОГО ПУЛА ===
+const POOL_FILE_PATH = process.env.POOL_FILE_PATH || './data/pool.json';
+
+interface PoolLink {
+  inviteCode: string;
+  fullLink: string;
+  status: 'ready' | 'pending' | 'joined' | 'failed';
+  addedAt: string;
+  processedAt?: string;
+  accountId?: string;
+  error?: string;
+}
+
+interface Pool {
+  version: number;
+  accounts: {
+    [accountId: string]: {
+      ready: PoolLink[];
+      pending: PoolLink[];
+      joined: PoolLink[];
+      failed: PoolLink[];
+    };
+  };
+  globalStats: {
+    total: number;
+    ready: number;
+    pending: number;
+    joined: number;
+    failed: number;
+  };
+}
+
+// Инициализация пула
+function initPool(): Pool {
+  return {
+    version: 1,
+    accounts: {},
+    globalStats: {
+      total: 0,
+      ready: 0,
+      pending: 0,
+      joined: 0,
+      failed: 0
+    }
+  };
+}
+
+// Загрузить пул из файла
+function loadPool(): Pool {
+  try {
+    if (fs.existsSync(POOL_FILE_PATH)) {
+      const data = fs.readFileSync(POOL_FILE_PATH, 'utf-8');
+      return JSON.parse(data);
+    }
+  } catch (error) {
+    console.error('Error loading pool:', error);
+  }
+  return initPool();
+}
+
+// Сохранить пул в файл
+function savePool(pool: Pool): void {
+  try {
+    const dir = POOL_FILE_PATH.substring(0, POOL_FILE_PATH.lastIndexOf('/'));
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(POOL_FILE_PATH, JSON.stringify(pool, null, 2));
+  } catch (error) {
+    console.error('Error saving pool:', error);
+  }
+}
+
+// Глобальный пул (в памяти)
+let globalPool: Pool = loadPool();
+
+// Инициализировать аккаунт в пуле
+function initAccountInPool(accountId: string): void {
+  if (!globalPool.accounts[accountId]) {
+    globalPool.accounts[accountId] = {
+      ready: [],
+      pending: [],
+      joined: [],
+      failed: []
+    };
+  }
+}
+
+// Добавить ссылки в пул (для всех аккаунтов)
+function addLinksToPool(links: string[]): { added: number; duplicates: number } {
+  let added = 0;
+  let duplicates = 0;
+
+  // Собираем все существующие коды
+  const existingCodes = new Set<string>();
+  for (const accId in globalPool.accounts) {
+    const acc = globalPool.accounts[accId];
+    acc.ready.forEach(l => existingCodes.add(l.inviteCode));
+    acc.pending.forEach(l => existingCodes.add(l.inviteCode));
+    acc.joined.forEach(l => existingCodes.add(l.inviteCode));
+    acc.failed.forEach(l => existingCodes.add(l.inviteCode));
+  }
+
+  // Получаем все подключенные аккаунты
+  const connectedAccounts = [...waAccounts.values()]
+    .filter(a => a.status === 'connected')
+    .map((_, id) => id);
+
+  if (connectedAccounts.length === 0) {
+    return { added: 0, duplicates: 0 };
+  }
+
+  // Распределяем ссылки между аккаунтами
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i];
+    const code = extractInviteCode(link);
+
+    if (!code) continue;
+
+    if (existingCodes.has(code)) {
+      duplicates++;
+      continue;
+    }
+
+    // Выбираем аккаунт по round-robin
+    const accountId = connectedAccounts[i % connectedAccounts.length];
+    initAccountInPool(accountId);
+
+    const poolLink: PoolLink = {
+      inviteCode: code,
+      fullLink: link,
+      status: 'ready',
+      addedAt: new Date().toISOString()
+    };
+
+    globalPool.accounts[accountId].ready.push(poolLink);
+    globalPool.globalStats.total++;
+    globalPool.globalStats.ready++;
+    existingCodes.add(code);
+    added++;
+  }
+
+  savePool(globalPool);
+  return { added, duplicates };
+}
+
+// Получить статистику пула
+function getPoolStats(): { total: number; ready: number; pending: number; joined: number; failed: number } {
+  return { ...globalPool.globalStats };
+}
+
+// Получить ссылки для обработки
+function getReadyLinks(accountId: string, count: number): PoolLink[] {
+  initAccountInPool(accountId);
+  const ready = globalPool.accounts[accountId].ready;
+  // Берем рандомные ссылки
+  const shuffled = [...ready].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, Math.min(count, shuffled.length));
+}
+
+// Обновить статус ссылки
+function updateLinkStatus(accountId: string, inviteCode: string, status: PoolLink['status'], error?: string): void {
+  const acc = globalPool.accounts[accountId];
+  if (!acc) return;
+
+  // Найти ссылку
+  let link: PoolLink | undefined;
+  let sourceArray: PoolLink[] | undefined;
+
+  for (const arr of [acc.ready, acc.pending, acc.joined, acc.failed]) {
+    const found = arr.find(l => l.inviteCode === inviteCode);
+    if (found) {
+      link = found;
+      sourceArray = arr;
+      break;
+    }
+  }
+
+  if (!link || !sourceArray) return;
+
+  // Удалить из старого массива
+  const idx = sourceArray.findIndex(l => l.inviteCode === inviteCode);
+  if (idx > -1) sourceArray.splice(idx, 1);
+
+  // Обновить глобальную статистику
+  globalPool.globalStats[link.status]--;
+
+  // Добавить в новый массив
+  link.status = status;
+  link.processedAt = new Date().toISOString();
+  link.accountId = accountId;
+  if (error) link.error = error;
+
+  globalPool.accounts[accountId][status].push(link);
+  globalPool.globalStats[status]++;
+
+  savePool(globalPool);
+}
+
+// Получить pending ссылки аккаунта
+function getAccountPendingLinks(accountId: string): PoolLink[] {
+  initAccountInPool(accountId);
+  return globalPool.accounts[accountId].pending;
+}
+
+// Количество ready ссылок
+function getReadyCount(accountId: string): number {
+  initAccountInPool(accountId);
+  return globalPool.accounts[accountId].ready.length;
+}
+
+// Количество pending ссылок
+function getPendingCount(accountId: string): number {
+  initAccountInPool(accountId);
+  return globalPool.accounts[accountId].pending.length;
+}
+
+// Получить всех connected аккаунтов с их статистикой
+function getAccountPoolStats(): { accountId: string; phone: string; ready: number; pending: number; joined: number; failed: number }[] {
+  const stats: { accountId: string; phone: string; ready: number; pending: number; joined: number; failed: number }[] = [];
+
+  waAccounts.forEach((acc, id) => {
+    if (acc.status === 'connected') {
+      initAccountInPool(id);
+      const accPool = globalPool.accounts[id];
+      stats.push({
+        accountId: id,
+        phone: acc.phone || acc.name || id,
+        ready: accPool.ready.length,
+        pending: accPool.pending.length,
+        joined: accPool.joined.length,
+        failed: accPool.failed.length
+      });
+    }
+  });
+
+  return stats;
+}
+
+// Очистить пул (только processed = joined + failed)
+function clearProcessedPool(): void {
+  for (const accId in globalPool.accounts) {
+    const acc = globalPool.accounts[accId];
+    globalPool.globalStats.joined -= acc.joined.length;
+    globalPool.globalStats.failed -= acc.failed.length;
+    acc.joined = [];
+    acc.failed = [];
+  }
+  savePool(globalPool);
+}
+
+// Очистить весь пул
+function clearAllPool(): void {
+  globalPool = initPool();
+  savePool(globalPool);
+}
 
 // Добавить заявку в очередь
 function addToPendingQueue(accountId: string, inviteCode: string, fullLink: string) {
@@ -277,14 +539,113 @@ async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ 
   }
 }
 
+// === ФУНКЦИИ ПАРСИНГА ФАЙЛОВ ===
+
+// Скачать файл по URL или получить локальный путь
+async function downloadFile(filePathOrUrl: string, destPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // Если это локальный путь
+    if (fs.existsSync(filePathOrUrl)) {
+      fs.copyFileSync(filePathOrUrl, destPath);
+      resolve(destPath);
+      return;
+    }
+
+    // Если это URL
+    const fileUrl = new URL(filePathOrUrl);
+    const protocol = fileUrl.protocol === 'https:' ? https : http;
+
+    protocol.get(fileUrl.href, (response) => {
+      if (response.statusCode === 200) {
+        const writer = fs.createWriteStream(destPath);
+        response.pipe(writer);
+        writer.on('finish', () => resolve(destPath));
+        writer.on('error', reject);
+      } else {
+        reject(new Error(`HTTP ${response.statusCode}`));
+      }
+    }).on('error', reject);
+  });
+}
+
+// Парсинг DOCX файла
+function parseDocx(filePath: string): string[] {
+  const links: string[] = [];
+  try {
+    const zip = new AdmZip(filePath);
+    const content = zip.readAsText('word/document.xml');
+
+    // Извлекаем все URL
+    const urlRegex = /https?:\/\/[^\s<>\"]+/gi;
+    const matches = content.match(urlRegex);
+
+    if (matches) {
+      for (const url of matches) {
+        if (url.includes('chat.whatsapp') || url.includes('invite.whatsapp')) {
+          // Убираем параметры после #
+          const cleanUrl = url.split('#')[0];
+          links.push(cleanUrl);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error parsing DOCX:', error);
+  }
+  return [...new Set(links)]; // Убираем дубликаты
+}
+
+// Парсинг TXT файла
+function parseTxt(filePath: string): string[] {
+  const links: string[] = [];
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split(/[\r\n]+/);
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Проверяем если это URL или просто код
+      if (trimmed.includes('chat.whatsapp') || trimmed.includes('invite.whatsapp')) {
+        const url = trimmed.split('#')[0].split('?')[0];
+        links.push(url);
+      } else if (/^[a-zA-Z0-9]{20,}$/.test(trimmed)) {
+        // Просто код ссылки
+        links.push(`https://chat.whatsapp.com/${trimmed}`);
+      }
+    }
+  } catch (error) {
+    console.error('Error parsing TXT:', error);
+  }
+  return [...new Set(links)]; // Убираем дубликаты
+}
+
+// Парсинг файла (определяет тип)
+async function parseFile(filePath: string): Promise<string[]> {
+  const ext = path.extname(filePath).toLowerCase();
+
+  if (ext === '.docx') {
+    return parseDocx(filePath);
+  } else if (ext === '.txt' || ext === '.csv') {
+    return parseTxt(filePath);
+  } else {
+    // Пробуем как TXT
+    return parseTxt(filePath);
+  }
+}
+
 // === МЕНЮ ===
-const mainMenu = () => Markup.inlineKeyboard([
-  [Markup.button.callback('📱 Аккаунты', 'accounts')],
-  [Markup.button.callback('📨 Рассылка', 'broadcast_menu')],
-  [Markup.button.callback('🔗 Присоединение к чатам', 'join_menu')],
-  [Markup.button.callback('📋 Pending заявки', 'pending_menu')],
-  [Markup.button.callback('⚙️ Настройки', 'settings')],
-]);
+const mainMenu = () => {
+  const stats = getPoolStats();
+  const poolIndicator = stats.total > 0 ? ` (${stats.ready} 🟢)` : '';
+
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📊 Пул чатов' + poolIndicator, 'pool_menu')],
+    [Markup.button.callback('📱 Аккаунты', 'accounts')],
+    [Markup.button.callback('📨 Рассылка', 'broadcast_menu')],
+    [Markup.button.callback('🔗 Присоединение к чатам', 'join_menu')],
+    [Markup.button.callback('📋 Pending заявки', 'pending_menu')],
+    [Markup.button.callback('⚙️ Настройки', 'settings')],
+  ]);
+};
 
 const accountsMenu = (accountId?: string) => {
   const buttons: any[][] = [];
@@ -517,6 +878,316 @@ bot.action(/^toggle_(.+)$/, async (ctx) => {
     ...accountsMenu(accountId)
   });
 });
+
+// === ПОЛУЧЕНИЕ ДОКУМЕНТОВ (ФАЙЛЫ) ===
+bot.on('document', async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) return;
+
+  const doc = ctx.message.document;
+  const fileName = doc.file_name || 'file';
+
+  // Проверяем тип файла
+  const ext = fileName.toLowerCase().split('.').pop();
+  if (!['docx', 'txt', 'csv'].includes(ext || '')) {
+    await safeReply(ctx, '❌ Неподдерживаемый формат.\n\n📋 Поддерживаемые форматы:\n• .docx\n• .txt\n• .csv');
+    return;
+  }
+
+  // Проверяем подключенные аккаунты
+  const connected = [...waAccounts.values()].filter(a => a.status === 'connected');
+  if (connected.length === 0) {
+    await safeReply(ctx, '❌ Нет подключенных аккаунтов WhatsApp.\n\nСначала подключите аккаунт в разделе "📱 Аккаунты"');
+    return;
+  }
+
+  try {
+    await safeReply(ctx, `📥 Получен файл: ${fileName}\n⏳ Парсинг ссылок...`);
+
+    // Скачиваем файл
+    const tempDir = '/tmp/wa-bot-uploads';
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    const filePath = `${tempDir}/${Date.now()}_${fileName}`;
+    const dest = await ctx.telegram.downloadFile(doc.file_id, tempDir);
+    fs.renameSync(dest, filePath);
+
+    // Парсим файл
+    const links = await parseFile(filePath);
+
+    if (links.length === 0) {
+      await safeReply(ctx, '❌ В файле не найдены WhatsApp ссылки.');
+      fs.unlinkSync(filePath);
+      return;
+    }
+
+    // Добавляем в пул
+    const result = addLinksToPool(links);
+
+    // Удаляем временный файл
+    fs.unlinkSync(filePath);
+
+    // Формируем отчет
+    let report = `✅ *Файл обработан!*\n\n`;
+    report += `📄 Файл: ${fileName}\n`;
+    report += `📊 Найдено ссылок: ${links.length}\n\n`;
+    report += `✅ Добавлено в пул: ${result.added}\n`;
+    if (result.duplicates > 0) {
+      report += `⏭️ Дубликатов пропущено: ${result.duplicates}\n`;
+    }
+
+    const stats = getPoolStats();
+    report += `\n📈 *Статистика пула:*\n`;
+    report += `🟢 Готовы: ${stats.ready}\n`;
+    report += `🔔 Pending: ${stats.pending}\n`;
+    report += `✅ Присоединено: ${stats.joined}\n`;
+    report += `❌ Ошибок: ${stats.failed}`;
+
+    await safeReply(ctx, report, { parse_mode: 'Markdown' });
+
+  } catch (error) {
+    console.error('Error processing document:', error);
+    await safeReply(ctx, `❌ Ошибка обработки файла: ${(error as Error).message}`);
+  }
+});
+
+// === МЕНЮ ПУЛА ===
+const poolMenu = () => {
+  const stats = getPoolStats();
+  const accStats = getAccountPoolStats();
+
+  let text = '📊 *Пул чатов*\n\n';
+  text += `📈 *Общая статистика:*\n`;
+  text += `🟢 Готовы: ${stats.ready}\n`;
+  text += `🔔 Pending: ${stats.pending}\n`;
+  text += `✅ Присоединено: ${stats.joined}\n`;
+  text += `❌ Ошибок: ${stats.failed}\n\n`;
+
+  if (accStats.length > 0) {
+    text += `📱 *По аккаунтам:*\n`;
+    accStats.forEach(acc => {
+      text += `\n📞 ${acc.phone}\n`;
+      text += `   🟢 ${acc.ready} | 🔔 ${acc.pending} | ✅ ${acc.joined}\n`;
+    });
+  }
+
+  const buttons: any[][] = [];
+
+  if (stats.ready > 0) {
+    buttons.push([Markup.button.callback('🚀 Начать присоединение', 'pool_start_join')]);
+  }
+  if (stats.pending > 0) {
+    buttons.push([Markup.button.callback('🔔 Обработать pending', 'pool_process_pending')]);
+  }
+  if (stats.joined > 0 || stats.failed > 0) {
+    buttons.push([Markup.button.callback('🗑️ Очистить обработанные', 'pool_clear_processed')]);
+  }
+  buttons.push([Markup.button.callback('🗑️ Очистить весь пул', 'pool_clear_all')]);
+  buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
+
+  return { text, buttons };
+};
+
+bot.action('pool_menu', async (ctx) => {
+  await safeAnswerCb(ctx);
+  const { text, buttons } = poolMenu();
+  await safeEdit(ctx, text, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons }
+  });
+});
+
+bot.action('pool_start_join', async (ctx) => {
+  await safeAnswerCb(ctx);
+  const stats = getPoolStats();
+  await safeEdit(ctx,
+    `🚀 *Выбор количества*\n\n` +
+    `🟢 Доступно ссылок: ${stats.ready}\n\n` +
+    `Выберите количество для обработки:`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('10', 'pool_join_10')],
+          [Markup.button.callback('20', 'pool_join_20')],
+          [Markup.button.callback('30', 'pool_join_30')],
+          [Markup.button.callback('50', 'pool_join_50')],
+          [Markup.button.callback('◀️ Назад', 'pool_menu')]
+        ]
+      }
+    }
+  );
+});
+
+bot.action('pool_process_pending', async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accStats = getAccountPoolStats();
+
+  if (accStats.length === 0) {
+    await safeReply(ctx, '❌ Нет подключенных аккаунтов');
+    return;
+  }
+
+  const stats = getPoolStats();
+  if (stats.pending === 0) {
+    await safeReply(ctx, '📭 Нет pending заявок');
+    return;
+  }
+
+  await safeReply(ctx, `🔔 *Проверка pending заявок*\n\n⏳ Обрабатываем...`, { parse_mode: 'Markdown' });
+
+  let totalApproved = 0;
+  let totalRejected = 0;
+
+  for (const acc of accStats) {
+    if (acc.pending === 0) continue;
+    const accData = waAccounts.get(acc.accountId);
+    if (!accData || accData.status !== 'connected') continue;
+
+    const pendingLinks = getAccountPendingLinks(acc.accountId);
+
+    for (const link of pendingLinks) {
+      try {
+        const result = await joinGroupByInvite(accData.client, link.inviteCode);
+        if (result.success) {
+          updateLinkStatus(acc.accountId, link.inviteCode, 'joined');
+          totalApproved++;
+        } else if (result.needsApproval) {
+          // Оставляем pending
+        } else {
+          updateLinkStatus(acc.accountId, link.inviteCode, 'failed', result.error);
+          totalRejected++;
+        }
+      } catch (error) {
+        updateLinkStatus(acc.accountId, link.inviteCode, 'failed', (error as Error).message);
+        totalRejected++;
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+
+  const newStats = getPoolStats();
+  await safeReply(ctx,
+    `🏁 *Проверка завершена*\n\n` +
+    `✅ Присоединено: ${totalApproved}\n` +
+    `❌ Отклонено: ${totalRejected}\n` +
+    `🔔 Ещё pending: ${newStats.pending}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.action('pool_clear_processed', async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearProcessedPool();
+  await safeReply(ctx, '🗑️ Обработанные ссылки удалены');
+  await safeEdit(ctx, '✅ Очередь очищена', {
+    reply_markup: { inline_keyboard: [[Markup.button.callback('◀️ К пулу', 'pool_menu')]] }
+  });
+});
+
+bot.action('pool_clear_all', async (ctx) => {
+  await safeAnswerCb(ctx);
+  await safeEdit(ctx,
+    `⚠️ *Очистить весь пул?*\n\n` +
+    `Это удалит ВСЕ ссылки!\n\n` +
+    `Действие нельзя отменить!`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('✅ Да, очистить', 'pool_confirm_clear_all')],
+          [Markup.button.callback('❌ Отмена', 'pool_menu')]
+        ]
+      }
+    }
+  );
+});
+
+bot.action('pool_confirm_clear_all', async (ctx) => {
+  await safeAnswerCb(ctx);
+  clearAllPool();
+  await safeReply(ctx, '🗑️ Весь пул очищен!');
+  await safeEdit(ctx, '✅ Пул очищен', {
+    reply_markup: { inline_keyboard: [[Markup.button.callback('◀️ К пулу', 'pool_menu')]] }
+  });
+});
+
+// Обработчики для разного количества
+for (const count of [10, 20, 30, 50]) {
+  bot.action(`pool_join_${count}`, async (ctx) => {
+    await safeAnswerCb(ctx);
+    const accStats = getAccountPoolStats();
+    if (accStats.length === 0) {
+      await safeReply(ctx, '❌ Нет подключенных аккаунтов');
+      return;
+    }
+
+    const stats = getPoolStats();
+    if (stats.ready === 0) {
+      await safeReply(ctx, '📭 Нет готовых ссылок');
+      return;
+    }
+
+    const actualCount = Math.min(count, stats.ready);
+
+    await safeReply(ctx,
+      `🚀 *Присоединение ${actualCount} ссылок*\n\n` +
+      `⏳ Распределяем между ${accStats.length} аккаунтами...`,
+      { parse_mode: 'Markdown' }
+    );
+
+    let totalJoined = 0, totalPending = 0, totalFailed = 0, totalAlready = 0;
+
+    for (const acc of accStats) {
+      const accData = waAccounts.get(acc.accountId);
+      if (!accData || accData.status !== 'connected') continue;
+
+      const linksForAcc = Math.ceil(actualCount / accStats.length);
+      const readyLinks = getReadyLinks(acc.accountId, linksForAcc);
+
+      for (let i = 0; i < readyLinks.length; i++) {
+        const link = readyLinks[i];
+
+        if (getPendingCount(acc.accountId) >= MAX_PENDING_JOIN_REQUESTS) continue;
+
+        try {
+          const result = await joinGroupByInvite(accData.client, link.inviteCode);
+          if (result.success) {
+            if (result.alreadyJoined) {
+              totalAlready++;
+            } else {
+              totalJoined++;
+            }
+            updateLinkStatus(acc.accountId, link.inviteCode, 'joined');
+          } else if (result.needsApproval) {
+            totalPending++;
+            updateLinkStatus(acc.accountId, link.inviteCode, 'pending');
+          } else {
+            totalFailed++;
+            updateLinkStatus(acc.accountId, link.inviteCode, 'failed', result.error);
+          }
+        } catch (error) {
+          totalFailed++;
+          updateLinkStatus(acc.accountId, link.inviteCode, 'failed', (error as Error).message);
+        }
+
+        await new Promise(r => setTimeout(r, JOIN_DELAY_MIN));
+      }
+    }
+
+    const newStats = getPoolStats();
+    await safeReply(ctx,
+      `🏁 *Завершено*\n\n` +
+      `✅ Присоединено: ${totalJoined}\n` +
+      `🔔 Pending: ${totalPending}\n` +
+      `❌ Ошибок: ${totalFailed}\n` +
+      `⏭️ Уже в группе: ${totalAlready}\n\n` +
+      `📊 Осталось: 🟢 ${newStats.ready} | 🔔 ${newStats.pending}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+}
 
 bot.action('add_account', async (ctx) => {
   await safeAnswerCb(ctx);
