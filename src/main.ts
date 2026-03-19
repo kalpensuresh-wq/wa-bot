@@ -84,6 +84,61 @@ const activeJoins = new Map<string, {
   accountId: string;
 }>();
 
+// === СИСТЕМА PENDING ЗАЯВОК ===
+interface PendingRequest {
+  inviteCode: string;
+  fullLink: string;
+  addedAt: Date;
+  status: 'pending' | 'approved' | 'rejected' | 'expired';
+}
+
+// Хранилище pending заявок: accountId -> PendingRequest[]
+const pendingJoinRequests = new Map<string, PendingRequest[]>();
+
+// Активный процесс обработки pending заявок
+const activePendingProcessor = new Map<string, {
+  stop: boolean;
+  total: number;
+  pending: number;
+  approved: number;
+  rejected: number;
+}>();
+
+// Добавить заявку в очередь
+function addToPendingQueue(accountId: string, inviteCode: string, fullLink: string) {
+  const queue = pendingJoinRequests.get(accountId) || [];
+  // Проверяем есть ли уже эта заявка
+  if (!queue.find(p => p.inviteCode === inviteCode)) {
+    queue.push({
+      inviteCode,
+      fullLink,
+      addedAt: new Date(),
+      status: 'pending'
+    });
+    pendingJoinRequests.set(accountId, queue);
+    console.log(`📋 Added to pending queue: ${inviteCode}`);
+  }
+}
+
+// Получить количество активных pending заявок
+function getActivePendingCount(accountId: string): number {
+  const queue = pendingJoinRequests.get(accountId) || [];
+  return queue.filter(p => p.status === 'pending').length;
+}
+
+// Получить следующую заявку для подачи
+function getNextPendingRequest(accountId: string): PendingRequest | null {
+  const queue = pendingJoinRequests.get(accountId) || [];
+  return queue.find(p => p.status === 'pending') || null;
+}
+
+// Удалить заявку из очереди
+function removeFromPendingQueue(accountId: string, inviteCode: string) {
+  const queue = pendingJoinRequests.get(accountId) || [];
+  const filtered = queue.filter(p => p.inviteCode !== inviteCode);
+  pendingJoinRequests.set(accountId, filtered);
+}
+
 // === БЕЗОПАСНЫЕ ОБЕРТКИ ===
 const safeReply = async (ctx: any, text: string, extra?: any) => {
   try {
@@ -227,6 +282,7 @@ const mainMenu = () => Markup.inlineKeyboard([
   [Markup.button.callback('📱 Аккаунты', 'accounts')],
   [Markup.button.callback('📨 Рассылка', 'broadcast_menu')],
   [Markup.button.callback('🔗 Присоединение к чатам', 'join_menu')],
+  [Markup.button.callback('📋 Pending заявки', 'pending_menu')],
   [Markup.button.callback('⚙️ Настройки', 'settings')],
 ]);
 
@@ -292,6 +348,38 @@ const joinSelectMenu = () => {
     buttons.push([Markup.button.callback('❌ Нет подключенных аккаунтов', 'main')]);
   }
   buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
+  return Markup.inlineKeyboard(buttons);
+};
+
+// === PENDING ЗАЯВКИ МЕНЮ ===
+const pendingSelectMenu = () => {
+  const buttons: any[][] = [];
+  waAccounts.forEach((acc, id) => {
+    if (acc.status === 'connected') {
+      const pendingCount = getActivePendingCount(id);
+      const indicator = pendingCount > 0 ? ` (${pendingCount} 🔔)` : '';
+      buttons.push([Markup.button.callback(`📱 ${acc.name || acc.phone}${indicator}`, `pending_acc_${id}`)]);
+    }
+  });
+  if (buttons.length === 0) {
+    buttons.push([Markup.button.callback('❌ Нет подключенных аккаунтов', 'main')]);
+  }
+  buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
+  return Markup.inlineKeyboard(buttons);
+};
+
+const pendingAccMenu = (accountId: string) => {
+  const queue = pendingJoinRequests.get(accountId) || [];
+  const pendingItems = queue.filter(p => p.status === 'pending');
+  const buttons: any[][] = [];
+
+  if (pendingItems.length > 0) {
+    buttons.push([Markup.button.callback('▶️ Проверить заявки', `check_pending_${accountId}`)]);
+    buttons.push([Markup.button.callback('🗑️ Очистить очередь', `clear_pending_${accountId}`)]);
+  } else {
+    buttons.push([Markup.button.callback('📭 Нет pending заявок', 'pending_menu')]);
+  }
+  buttons.push([Markup.button.callback('◀️ Назад', 'pending_menu')]);
   return Markup.inlineKeyboard(buttons);
 };
 
@@ -667,6 +755,70 @@ bot.action(/^confirm_join_(.+)$/, async (ctx) => {
     return;
   }
   await startJoinProcess(ctx, accountId, links);
+});
+
+// === PENDING ЗАЯВКИ ===
+bot.action('pending_menu', async (ctx) => {
+  await safeAnswerCb(ctx);
+  let text = '📋 *Pending заявки*\n\n';
+  text += `🛡️ *Логика работы:*\n`;
+  text += `• Присоединение → сразу вступаем\n`;
+  text += `• Требует одобрение → в очередь\n`;
+  text += `• Максимум ${MAX_PENDING_JOIN_REQUESTS} активных заявок\n`;
+  text += `• После одобрения → вступаем\n\n`;
+  text += `Выберите аккаунт:`;
+  await safeEdit(ctx, text, { parse_mode: 'Markdown', ...pendingSelectMenu() });
+});
+
+bot.action(/^pending_acc_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') {
+    await safeEdit(ctx, '❌ Аккаунт не подключен', { ...pendingSelectMenu() });
+    return;
+  }
+  const queue = pendingJoinRequests.get(accountId) || [];
+  const pendingItems = queue.filter(p => p.status === 'pending');
+  const activeCount = pendingItems.length;
+
+  let text = `📋 *Pending заявки*\n\n`;
+  text += `📱 Аккаунт: ${acc.name || acc.phone}\n`;
+  text += `⏳ Активных: ${activeCount}/${MAX_PENDING_JOIN_REQUESTS}\n\n`;
+
+  if (pendingItems.length > 0) {
+    text += `📋 *В очереди:*\n`;
+    pendingItems.forEach((item, idx) => {
+      const timeAgo = Math.floor((Date.now() - item.addedAt.getTime()) / 60000);
+      text += `${idx + 1}. ${item.inviteCode.substring(0, 15)}...\n   ⏱ ${timeAgo} мин назад\n`;
+    });
+  } else {
+    text += `📭 Очередь пуста\n`;
+  }
+
+  await safeEdit(ctx, text, { parse_mode: 'Markdown', ...pendingAccMenu(accountId) });
+});
+
+bot.action(/^check_pending_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') {
+    await safeReply(ctx, '❌ Аккаунт не подключен');
+    return;
+  }
+  await checkPendingRequests(ctx, accountId);
+});
+
+bot.action(/^clear_pending_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  pendingJoinRequests.delete(accountId);
+  await safeReply(ctx, '🗑️ Очередь pending заявок очищена');
+  await safeEdit(ctx, '✅ Очередь очищена!', { ...pendingAccMenu(accountId) });
 });
 
 // === SETTINGS ===
@@ -1069,18 +1221,21 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
   await safeReply(ctx,
     `🔗 *Присоединение к чатам*\n\n` +
     `📱 Аккаунт: ${acc.name || acc.phone}\n` +
-    `📊 Найдено ссылок: ${validLinks.length}\n` +
-    `🚫 Пропускаем чаты требующие одобрения\n\n` +
+    `📊 Найдено ссылок: ${validLinks.length}\n\n` +
+    `🛡️ *Логика:*\n` +
+    `• Сразу вступаем (без одобрения)\n` +
+    `• Требует одобрение → в pending очередь\n` +
+    `• Максимум ${MAX_PENDING_JOIN_REQUESTS} pending заявок\n\n` +
     `⏳ Начинаем...`,
     { parse_mode: 'Markdown' }
   );
 
-  let joined = 0, alreadyJoined = 0, failed = 0, skippedApproval = 0, joinsSinceBreak = 0;
+  let joined = 0, alreadyJoined = 0, failed = 0, addedToPending = 0, joinsSinceBreak = 0;
 
   for (let i = 0; i < validLinks.length; i++) {
     const join = activeJoins.get(joinId);
     if (join?.stop) {
-      await safeReply(ctx, `⏹ Остановлено\n✅ Присоединено: ${joined} | ❌ Ошибок: ${failed} | 🚫 Пропущено: ${skippedApproval}`);
+      await safeReply(ctx, `⏹ Остановлено\n✅ Присоединено: ${joined} | ❌ Ошибок: ${failed} | 📋 В pending: ${addedToPending}`);
       activeJoins.delete(joinId);
       return;
     }
@@ -1095,8 +1250,24 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
       await safeReply(ctx, `✅ Перерыв завершён, продолжаем...`);
     }
 
+    // Проверяем количество pending заявок
+    const currentPending = getActivePendingCount(accountId);
+    if (currentPending >= MAX_PENDING_JOIN_REQUESTS) {
+      // Превышен лимит pending - пропускаем остальные ссылки
+      const remaining = validLinks.length - i;
+      await safeReply(ctx,
+        `⚠️ *Лимит pending заявок достигнут (${MAX_PENDING_JOIN_REQUESTS})*\n\n` +
+        `📋 Осталось ссылок: ${remaining}\n` +
+        `📋 В pending очереди: ${currentPending}\n\n` +
+        `⏳ Продолжите после одобрения заявок\n` +
+        `🔔 Используйте "📋 Pending заявки" для проверки`,
+        { parse_mode: 'Markdown' }
+      );
+      break;
+    }
+
     const inviteCode = validLinks[i];
-    console.log(`[${i+1}/${validLinks.length}] Joining: ${inviteCode}`);
+    console.log(`[${i+1}/${validLinks.length}] Joining: ${inviteCode} (pending: ${currentPending}/${MAX_PENDING_JOIN_REQUESTS})`);
 
     try {
       const result = await joinGroupByInvite(acc.client, inviteCode);
@@ -1104,9 +1275,10 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
         if (result.alreadyJoined) alreadyJoined++;
         else { joined++; joinsSinceBreak++; }
       } else if (result.needsApproval) {
-        // Чат требует одобрения - пропускаем
-        skippedApproval++;
-        console.log(`  🚫 Skipped (requires approval)`);
+        // Чат требует одобрения - добавляем в pending очередь
+        addToPendingQueue(accountId, inviteCode, links[i]);
+        addedToPending++;
+        console.log(`  📋 Added to pending queue`);
       } else {
         failed++;
       }
@@ -1117,7 +1289,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
           `✅ Присоединено: ${joined}\n` +
           `⏭️ Уже в группе: ${alreadyJoined}\n` +
           `❌ Ошибок: ${failed}\n` +
-          `🚫 Пропущено (одобрение): ${skippedApproval}`
+          `📋 В pending: ${addedToPending}`
         );
       }
     } catch (error) {
@@ -1132,15 +1304,119 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
   }
 
   pendingGroupLinks.delete(accountId);
-  await safeReply(ctx,
-    `🏁 *Присоединение завершено*\n\n` +
+
+  const pendingCount = getActivePendingCount(accountId);
+  let finalText = `🏁 *Присоединение завершено*\n\n` +
     `✅ Присоединено: ${joined}\n` +
     `⏭️ Уже в группе: ${alreadyJoined}\n` +
     `❌ Ошибок: ${failed}\n` +
-    `🚫 Пропущено (требовало одобрение): ${skippedApproval}`,
+    `📋 Добавлено в pending: ${addedToPending}`;
+
+  if (pendingCount > 0) {
+    finalText += `\n\n📋 *В pending очереди:* ${pendingCount}\n🔔 Одобрите заявки в WhatsApp, затем нажмите "Проверить заявки"`;
+  }
+
+  await safeReply(ctx, finalText, { parse_mode: 'Markdown' });
+  activeJoins.delete(joinId);
+}
+
+// Функция проверки pending заявок
+async function checkPendingRequests(ctx: any, accountId: string) {
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') return safeReply(ctx, '❌ Аккаунт не подключен');
+
+  const queue = pendingJoinRequests.get(accountId) || [];
+  const pendingItems = queue.filter(p => p.status === 'pending');
+
+  if (pendingItems.length === 0) {
+    await safeReply(ctx, '📭 Нет pending заявок для проверки');
+    return;
+  }
+
+  const processorId = Date.now().toString();
+  activePendingProcessor.set(processorId, {
+    stop: false,
+    total: pendingItems.length,
+    pending: pendingItems.length,
+    approved: 0,
+    rejected: 0
+  });
+
+  await safeReply(ctx,
+    `🔍 *Проверка pending заявок*\n\n` +
+    `📋 Всего: ${pendingItems.length}\n` +
+    `⏳ Проверяем...`,
     { parse_mode: 'Markdown' }
   );
-  activeJoins.delete(joinId);
+
+  let approved = 0;
+  let stillPending = 0;
+  let rejected = 0;
+
+  for (let i = 0; i < pendingItems.length; i++) {
+    const processor = activePendingProcessor.get(processorId);
+    if (processor?.stop) break;
+
+    const item = pendingItems[i];
+    console.log(`[Check ${i+1}/${pendingItems.length}] Checking: ${item.inviteCode}`);
+
+    try {
+      // Пытаемся присоединиться повторно
+      const result = await joinGroupByInvite(acc.client, item.inviteCode);
+
+      if (result.success) {
+        // Заявка одобрена!
+        approved++;
+        item.status = 'approved';
+        console.log(`  ✅ Request approved: ${item.inviteCode}`);
+      } else if (result.needsApproval) {
+        // Всё ещё требует одобрения
+        stillPending++;
+        console.log(`  ⏳ Still pending: ${item.inviteCode}`);
+      } else {
+        // Заявка отклонена или истекла
+        rejected++;
+        item.status = 'rejected';
+        console.log(`  ❌ Request rejected/expired: ${item.inviteCode}`);
+      }
+    } catch (error) {
+      console.error(`  ❌ Error checking:`, error);
+      rejected++;
+      item.status = 'rejected';
+    }
+
+    // Обновляем прогресс каждые 3 заявки
+    if (i % 3 === 0 || i === pendingItems.length - 1) {
+      await safeReply(ctx,
+        `📊 Проверено: ${i + 1}/${pendingItems.length}\n` +
+        `✅ Одобрено: ${approved}\n` +
+        `⏳ Ещё pending: ${stillPending}\n` +
+        `❌ Отклонено: ${rejected}`
+      );
+    }
+
+    // Задержка между проверками
+    if (i < pendingItems.length - 1) {
+      await new Promise(r => setTimeout(r, 5000)); // 5 секунд
+    }
+  }
+
+  // Удаляем обработанные заявки
+  const updatedQueue = queue.filter(p => p.status === 'pending');
+  pendingJoinRequests.set(accountId, updatedQueue);
+
+  const remainingPending = updatedQueue.length;
+
+  await safeReply(ctx,
+    `🏁 *Проверка завершена*\n\n` +
+    `✅ Одобрено: ${approved}\n` +
+    `⏳ Ещё pending: ${remainingPending}\n` +
+    `❌ Отклонено: ${rejected}\n\n` +
+    (remainingPending > 0 ? `⏳ Дождитесь одобрения остальных заявок\n🔔 Затем нажмите "Проверить заявки" снова` : `🎉 Все заявки обработаны!`),
+    { parse_mode: 'Markdown' }
+  );
+
+  activePendingProcessor.delete(processorId);
 }
 
 // Global error handler
