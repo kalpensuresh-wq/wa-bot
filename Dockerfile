@@ -36,6 +36,9 @@ COPY . .
 
 RUN npm run build
 
+# Force rebuild - cache clear
+RUN rm -rf /app/dist && npm run build
+
 RUN mkdir -p /app/wa-sessions && chmod -R 777 /app/wa-sessions
 
 ENV PORT=3000
