@@ -15,23 +15,13 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -85,6 +75,7 @@ const JOIN_DELAY_MIN = 10 * 60 * 1000;
 const JOIN_DELAY_MAX = 10 * 60 * 1000;
 const MAX_JOINS_BEFORE_BREAK = 30;
 const JOIN_BREAK_DURATION = 4 * 60 * 60 * 1000;
+const MAX_PENDING_JOIN_REQUESTS = 5; // Максимум 5 ожидающих заявок
 const activeJoins = new Map();
 // === БЕЗОПАСНЫЕ ОБЕРТКИ ===
 const safeReply = async (ctx, text, extra) => {
@@ -179,9 +170,23 @@ async function joinGroupByInvite(client, inviteCode) {
             console.log(`  ⚠️ Already a member of this group: ${existingChat.name || inviteCode}`);
             return { success: true, alreadyJoined: true };
         }
-        await client.acceptInvite(inviteCode);
-        console.log(`  ✓ Successfully joined group`);
-        return { success: true };
+        // Проверяем требование одобрения ДО попытки присоединения
+        // Если сразу видим что нужно одобрение - пропускаем
+        try {
+            await client.acceptInvite(inviteCode);
+            console.log(`  ✓ Successfully joined group`);
+            return { success: true };
+        }
+        catch (joinError) {
+            const joinErrorMsg = joinError.message || String(joinError);
+            // Если требуется одобрение - пропускаем чат (не подаём заявку)
+            if (joinErrorMsg.includes('approval') || joinErrorMsg.includes('join') || joinErrorMsg.includes('require') || joinErrorMsg.includes('Admin')) {
+                console.log(`  ⚠️ Group requires approval - skipping`);
+                return { success: false, error: 'Требуется одобрение', needsApproval: true, skipped: true };
+            }
+            // Для других ошибок - пробросим их выше
+            throw joinError;
+        }
     }
     catch (error) {
         const errorMessage = error.message || String(error);
@@ -189,7 +194,7 @@ async function joinGroupByInvite(client, inviteCode) {
         if (errorMessage.includes('invalid') || errorMessage.includes('expired')) {
             return { success: false, error: 'Ссылка недействительна или истекла' };
         }
-        if (errorMessage.includes('approval') || errorMessage.includes('join') || errorMessage.includes('require')) {
+        if (errorMessage.includes('approval') || errorMessage.includes('join') || errorMessage.includes('require') || errorMessage.includes('Admin')) {
             return { success: false, error: 'Требуется одобрение администратора', needsApproval: true };
         }
         if (errorMessage.includes('not found') || errorMessage.includes('404')) {
@@ -973,16 +978,17 @@ async function startJoinProcess(ctx, accountId, links) {
     if (validLinks.length === 0)
         return safeReply(ctx, '❌ Не найдено валидных ссылок');
     const joinId = Date.now().toString();
-    activeJoins.set(joinId, { stop: false, joined: 0, failed: 0, total: validLinks.length, accountId });
+    activeJoins.set(joinId, { stop: false, joined: 0, failed: 0, skippedApproval: 0, total: validLinks.length, accountId });
     await safeReply(ctx, `🔗 *Присоединение к чатам*\n\n` +
         `📱 Аккаунт: ${acc.name || acc.phone}\n` +
-        `📊 Найдено ссылок: ${validLinks.length}\n\n` +
+        `📊 Найдено ссылок: ${validLinks.length}\n` +
+        `🚫 Пропускаем чаты требующие одобрения\n\n` +
         `⏳ Начинаем...`, { parse_mode: 'Markdown' });
-    let joined = 0, alreadyJoined = 0, failed = 0, needsApproval = 0, joinsSinceBreak = 0;
+    let joined = 0, alreadyJoined = 0, failed = 0, skippedApproval = 0, joinsSinceBreak = 0;
     for (let i = 0; i < validLinks.length; i++) {
         const join = activeJoins.get(joinId);
         if (join?.stop) {
-            await safeReply(ctx, `⏹ Остановлено\n✅ Присоединено: ${joined} | ❌ Ошибок: ${failed} | ⏳ Ожидает одобрения: ${needsApproval}`);
+            await safeReply(ctx, `⏹ Остановлено\n✅ Присоединено: ${joined} | ❌ Ошибок: ${failed} | 🚫 Пропущено: ${skippedApproval}`);
             activeJoins.delete(joinId);
             return;
         }
@@ -1004,16 +1010,20 @@ async function startJoinProcess(ctx, accountId, links) {
                     joinsSinceBreak++;
                 }
             }
-            else if (result.needsApproval)
-                needsApproval++;
-            else
+            else if (result.needsApproval) {
+                // Чат требует одобрения - пропускаем
+                skippedApproval++;
+                console.log(`  🚫 Skipped (requires approval)`);
+            }
+            else {
                 failed++;
+            }
             if (i % 3 === 0 || i === validLinks.length - 1) {
                 await safeReply(ctx, `📊 ${i + 1}/${validLinks.length}\n` +
                     `✅ Присоединено: ${joined}\n` +
                     `⏭️ Уже в группе: ${alreadyJoined}\n` +
                     `❌ Ошибок: ${failed}\n` +
-                    `⏳ Ожидает одобрения: ${needsApproval}`);
+                    `🚫 Пропущено (одобрение): ${skippedApproval}`);
             }
         }
         catch (error) {
@@ -1030,7 +1040,7 @@ async function startJoinProcess(ctx, accountId, links) {
         `✅ Присоединено: ${joined}\n` +
         `⏭️ Уже в группе: ${alreadyJoined}\n` +
         `❌ Ошибок: ${failed}\n` +
-        `⏳ Требует одобрения: ${needsApproval}`, { parse_mode: 'Markdown' });
+        `🚫 Пропущено (требовало одобрение): ${skippedApproval}`, { parse_mode: 'Markdown' });
     activeJoins.delete(joinId);
 }
 // Global error handler
