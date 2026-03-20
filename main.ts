@@ -24,6 +24,9 @@ interface AccountData {
   enabled: boolean;
   sentToday: number;
   failedToday: number;
+  broadcastDelay: number;
+  joinDelay: number;
+  autoJoinPending: boolean;
 }
 
 // Сохранить данные аккаунтов
@@ -37,7 +40,10 @@ function saveAccountsData(): void {
         customMessage: acc.customMessage || '',
         enabled: acc.enabled,
         sentToday: acc.sentToday,
-        failedToday: acc.failedToday
+        failedToday: acc.failedToday,
+        broadcastDelay: acc.broadcastDelay || 10,
+        joinDelay: acc.joinDelay || 10,
+        autoJoinPending: acc.autoJoinPending
       };
     });
     const dir = ACCOUNTS_FILE_PATH.substring(0, ACCOUNTS_FILE_PATH.lastIndexOf('/'));
@@ -108,7 +114,12 @@ async function restoreExistingAccounts(): Promise<void> {
       customMessage: accData.customMessage || '',
       enabled: accData.enabled,
       sentToday: accData.sentToday,
-      failedToday: accData.failedToday
+      failedToday: accData.failedToday,
+      broadcastDelay: accData.broadcastDelay || 10,
+      joinDelay: accData.joinDelay || 10,
+      isBroadcasting: false,
+      isJoining: false,
+      autoJoinPending: accData.autoJoinPending || false
     });
 
     client.on('ready', async () => {
@@ -190,6 +201,11 @@ const waAccounts = new Map<string, {
   enabled: boolean;
   sentToday: number;
   failedToday: number;
+  broadcastDelay: number;     // Задержка для рассылки в минутах
+  joinDelay: number;          // Задержка для присоединения в минутах
+  isBroadcasting: boolean;    // Активна ли рассылка
+  isJoining: boolean;          // Активен ли процесс присоединения
+  autoJoinPending: boolean;    // Авто-повтор для pending групп
 }>();
 
 const userStates = new Map<number, { action: string; accountId?: string }>();
@@ -609,8 +625,30 @@ async function simulateHumanTyping(client: Client, chatId: string, duration: num
   } catch (e) {}
 }
 
-function getRandomJoinDelay(): number {
-  return Math.floor(Math.random() * (JOIN_DELAY_MAX - JOIN_DELAY_MIN + 1)) + JOIN_DELAY_MIN;
+// Функция для получения задержки с ±1 минутой рандомом
+function getDelayWithRandom(baseDelayMinutes: number): number {
+  // ±1 минута рандом
+  const randomMinutes = baseDelayMinutes + (Math.random() * 2 - 1);
+  return Math.round(randomMinutes * 60 * 1000); // в миллисекунды
+}
+
+function getRandomJoinDelay(accountId?: string): number {
+  if (accountId) {
+    const acc = waAccounts.get(accountId);
+    if (acc) {
+      return getDelayWithRandom(acc.joinDelay);
+    }
+  }
+  return getDelayWithRandom(10); // По умолчанию 10 минут
+}
+
+// Получить задержку для рассылки с учётом настроек аккаунта
+function getBroadcastDelay(accountId: string): number {
+  const acc = waAccounts.get(accountId);
+  if (acc) {
+    return getDelayWithRandom(acc.broadcastDelay);
+  }
+  return getDelayWithRandom(10); // По умолчанию 10 минут
 }
 
 // Проверка валидности сессии WhatsApp
@@ -846,12 +884,18 @@ const accountsMenu = (accountId?: string) => {
       buttons.push([Markup.button.callback(`${enabledEmoji} Рассылка: ${acc.enabled ? 'ВКЛ' : 'ВЫКЛ'}`, `toggle_${accountId}`)]);
       if (acc.status === 'connected') {
         buttons.push([Markup.button.callback('📝 Изменить текст', `edit_msg_${accountId}`)]);
+        // Настройки задержек
+        buttons.push([Markup.button.callback(`⏱ Рассылка: ${acc.broadcastDelay} мин (±1)`, `set_broadcast_delay_${accountId}`)]);
+        buttons.push([Markup.button.callback(`🔗 Присоединение: ${acc.joinDelay} мин (±1)`, `set_join_delay_${accountId}`)]);
+        // Авто-повтор pending
+        const autoText = acc.autoJoinPending ? '🔄 Авто-повтор: ВКЛ' : '🔄 Авто-повтор: ВЫКЛ';
+        buttons.push([Markup.button.callback(autoText, `toggle_auto_pending_${accountId}`)]);
         buttons.push([Markup.button.callback('🔍 Просмотр чатов', `view_chats_${accountId}`)]);
       }
       buttons.push([Markup.button.callback('🔄 Проверить статус', `refresh_acc_${accountId}`)]);
       buttons.push([Markup.button.callback('❌ Отвязать номер', `unbind_${accountId}`)]);
     }
-    buttons.push([Markup.button.callback('◀️ Назад к списку', 'accounts')]);
+    buttons.push([Markup.button.callback('◀️ Назад к списку', 'accounts'));
   } else {
     if (waAccounts.size > 0) {
       waAccounts.forEach((acc, id) => {
@@ -1528,6 +1572,61 @@ bot.action(/^edit_msg_(.+)$/, async (ctx) => {
   );
 });
 
+// Настройка задержки рассылки для аккаунта
+bot.action(/^set_broadcast_delay_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  userStates.set(ctx.from!.id, { action: 'waiting_account_broadcast_delay', accountId });
+  const acc = waAccounts.get(accountId);
+  await safeEdit(ctx,
+    `⏱ *Задержка рассылки*\n\n` +
+    `📱 Аккаунт: ${acc?.name || acc?.phone || accountId}\n` +
+    `📊 Текущая: ${acc?.broadcastDelay || 10} мин (±1 мин)\n\n` +
+    `Введите новую задержку (1-60 минут):`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', `acc_${accountId}`)]])
+    }
+  );
+});
+
+// Настройка задержки присоединения для аккаунта
+bot.action(/^set_join_delay_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  userStates.set(ctx.from!.id, { action: 'waiting_account_join_delay', accountId });
+  const acc = waAccounts.get(accountId);
+  await safeEdit(ctx,
+    `🔗 *Задержка присоединения*\n\n` +
+    `📱 Аккаунт: ${acc?.name || acc?.phone || accountId}\n` +
+    `📊 Текущая: ${acc?.joinDelay || 10} мин (±1 мин)\n\n` +
+    `Введите новую задержку (1-60 минут):`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', `acc_${accountId}`)]])
+    }
+  );
+});
+
+// Переключение авто-повтора для pending заявок
+bot.action(/^toggle_auto_pending_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  const acc = waAccounts.get(accountId);
+  if (acc) {
+    acc.autoJoinPending = !acc.autoJoinPending;
+    saveAccountsData();
+    await safeReply(ctx, `✅ Авто-повтор для pending: ${acc.autoJoinPending ? 'ВКЛЮЧЁН' : 'ВЫКЛЮЧЁН'}`);
+  }
+  await safeEdit(ctx, '📱 *Настройки обновлены*\n\nНажмите "◀️ Назад" для возврата', {
+    parse_mode: 'Markdown',
+    ...accountsMenu(accountId)
+  });
+});
+
 bot.action(/^view_chats_(.+)$/, async (ctx) => {
   await safeAnswerCb(ctx, 'Загрузка чатов...');
   const accountId = ctx.match?.[1];
@@ -1646,19 +1745,19 @@ bot.action(/^broadcast_acc_(.+)$/, async (ctx) => {
     );
     return;
   }
+  // Текст уже есть - спрашиваем задержку
+  userStates.set(ctx.from!.id, { action: 'waiting_broadcast_delay', accountId });
   await safeEdit(ctx,
-    `📨 *Подтверждение рассылки*\n\n` +
-    `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
-    `📝 *Текст:*\n${acc.customMessage}\n\n` +
-    `⚠️ Отправить во все архивные чаты?\n` +
-    `⏱ Задержка: 10 минут между сообщениями\n` +
-    `🔄 После каждого сообщения - ожидание`,
+    `📨 *Рассылка с ${acc.name || acc.phone}*\n\n` +
+    `📝 *Текст:*\n${acc.customMessage.substring(0, 100)}${acc.customMessage.length > 100 ? '...' : ''}\n\n` +
+    `⏱ Введите задержку между сообщениями (в минутах):\n` +
+    `Например: 5 или 10\n\n` +
+    `±1 минута рандом будет добавлена автоматически.`,
     {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
-          [Markup.button.callback('✅ Да, начать', `confirm_broadcast_${accountId}`)],
-          [Markup.button.callback('❌ Отмена', 'broadcast_menu')]
+          [Markup.button.callback('◀️ Назад', 'broadcast_menu')]
         ]
       }
     }
@@ -1698,14 +1797,21 @@ bot.action(/^join_acc_(.+)$/, async (ctx) => {
     await safeEdit(ctx, '❌ Аккаунт не подключен', { ...joinSelectMenu() });
     return;
   }
-  userStates.set(ctx.from!.id, { action: 'waiting_group_links', accountId });
+  // Сначала спрашиваем задержку (пользователь вводит число)
+  userStates.set(ctx.from!.id, { action: 'waiting_join_delay', accountId });
   await safeEdit(ctx,
     `🔗 *Присоединение к чатам*\n\n` +
     `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
-    `Введите ссылки на группы через пробел:`,
+    `⏱ Введите задержку между присоединениями (в минутах):\n` +
+    `Например: 5 или 10\n\n` +
+    `±1 минута рандом будет добавлена автоматически.`,
     {
       parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'join_menu')]])
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('◀️ Назад', 'join_menu')]
+        ]
+      }
     }
   );
 });
@@ -1869,9 +1975,122 @@ bot.on('text', async (ctx) => {
       const acc = waAccounts.get(accountId!);
       if (acc) {
         acc.customMessage = ctx.message.text;
-        await safeReply(ctx, '✅ Текст сохранен. Нажмите "Да, начать" для рассылки.');
+        userStates.set(ctx.from!.id, { action: 'waiting_broadcast_delay', accountId });
+        await safeReply(ctx,
+          `✅ Текст сохранен!\n\n` +
+          `📝 Текст: "${ctx.message.text.substring(0, 50)}${ctx.message.text.length > 50 ? '...' : ''}"\n\n` +
+          `⏱ Введите задержку между сообщениями (в минутах):\n` +
+          `Например: 5 или 10`,
+          { parse_mode: 'Markdown' }
+        );
       }
+      return;
+    }
+
+    // Новый обработчик для ввода задержки рассылки
+    if (state.action === 'waiting_broadcast_delay') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      const delayMinutes = parseInt(ctx.message.text.trim());
+      if (isNaN(delayMinutes) || delayMinutes < 1 || delayMinutes > 60) {
+        await safeReply(ctx, '❌ Введите число от 1 до 60 минут');
+        return;
+      }
+      acc.broadcastDelay = delayMinutes;
+      saveAccountsData();
+
       userStates.delete(ctx.from!.id);
+      await safeReply(ctx,
+        `✅ Задержка установлена: ${delayMinutes} мин (±1 мин рандом)\n\n` +
+        `📨 *Подтверждение рассылки*\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `⏱ Задержка: ${delayMinutes} мин (±1 мин)\n\n` +
+        `Нажмите "Да, начать" для запуска рассылки.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback(`✅ Да, начать (${delayMinutes} мин)`, `confirm_broadcast_${accountId}`)],
+              [Markup.button.callback('❌ Отмена', 'broadcast_menu')]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    // Ввод задержки для присоединения
+    if (state.action === 'waiting_join_delay') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      const delayMinutes = parseInt(ctx.message.text.trim());
+      if (isNaN(delayMinutes) || delayMinutes < 1 || delayMinutes > 60) {
+        await safeReply(ctx, '❌ Введите число от 1 до 60 минут');
+        return;
+      }
+      acc.joinDelay = delayMinutes;
+      saveAccountsData();
+
+      userStates.delete(ctx.from!.id);
+      await safeReply(ctx,
+        `✅ Задержка установлена: ${delayMinutes} мин (±1 мин рандом)\n\n` +
+        `🔗 *Подтверждение присоединения*\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `⏱ Задержка: ${delayMinutes} мин (±1 мин)\n\n` +
+        `Введите ссылки на группы через пробел.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('◀️ Назад', 'join_menu')]
+            ]
+          }
+        }
+      );
+      // Сохраняем состояние для ожидания ссылок
+      userStates.set(ctx.from!.id, { action: 'waiting_group_links', accountId });
+      return;
+    }
+
+    // Настройка задержки рассылки из меню аккаунта
+    if (state.action === 'waiting_account_broadcast_delay') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      const delayMinutes = parseInt(ctx.message.text.trim());
+      if (isNaN(delayMinutes) || delayMinutes < 1 || delayMinutes > 60) {
+        await safeReply(ctx, '❌ Введите число от 1 до 60 минут');
+        return;
+      }
+      acc.broadcastDelay = delayMinutes;
+      saveAccountsData();
+      await safeReply(ctx,
+        `✅ Задержка рассылки установлена: ${delayMinutes} мин (±1 мин рандом)\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `⏱ Новая задержка: ${delayMinutes} мин`
+      );
+      userStates.delete(ctx.from!.id);
+      await safeEdit(ctx, '✅ Задержка рассылки обновлена!', { ...accountsMenu(accountId) });
+      return;
+    }
+
+    // Настройка задержки присоединения из меню аккаунта
+    if (state.action === 'waiting_account_join_delay') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      const delayMinutes = parseInt(ctx.message.text.trim());
+      if (isNaN(delayMinutes) || delayMinutes < 1 || delayMinutes > 60) {
+        await safeReply(ctx, '❌ Введите число от 1 до 60 минут');
+        return;
+      }
+      acc.joinDelay = delayMinutes;
+      saveAccountsData();
+      await safeReply(ctx,
+        `✅ Задержка присоединения установлена: ${delayMinutes} мин (±1 мин рандом)\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `⏱ Новая задержка: ${delayMinutes} мин`
+      );
+      userStates.delete(ctx.from!.id);
+      await safeEdit(ctx, '✅ Задержка присоединения обновлена!', { ...accountsMenu(accountId) });
       return;
     }
 
@@ -1957,6 +2176,11 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
     enabled: true,
     sentToday: 0,
     failedToday: 0,
+    broadcastDelay: 10,  // По умолчанию 10 минут
+    joinDelay: 10,      // По умолчанию 10 минут
+    isBroadcasting: false,
+    isJoining: false,
+    autoJoinPending: true
   });
 
   let qrSent = false;
@@ -2057,13 +2281,24 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
   if (!acc || acc.status !== 'connected') {
     return safeReply(ctx, '❌ Аккаунт не подключен');
   }
+
+  // Проверяем, не идёт ли уже рассылка
+  if (acc.isBroadcasting) {
+    return safeReply(ctx, '⏳ На этом аккаунте уже идёт рассылка!');
+  }
+  // NOTE: присоединение и рассылка могут идти одновременно на одном аккаунте
+
   isBroadcasting = true;
+  acc.isBroadcasting = true;
+
   if (!acc.enabled) {
     isBroadcasting = false;
+    acc.isBroadcasting = false;
     return safeReply(ctx, '❌ Этот аккаунт выключен для рассылки');
   }
   if (acc.sentToday >= MAX_MESSAGES_PER_DAY) {
     isBroadcasting = false;
+    acc.isBroadcasting = false;
     return safeReply(ctx, `❌ Достигнут дневной лимит (${MAX_MESSAGES_PER_DAY} сообщений)`);
   }
 
@@ -2074,6 +2309,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     const archivedChats = chats.filter((chat: any) => chat.archived);
     if (archivedChats.length === 0) {
       isBroadcasting = false;
+      acc.isBroadcasting = false;
       return safeReply(ctx, '❌ Архивные чаты не найдены');
     }
 
@@ -2082,7 +2318,8 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     const broadcastId = Date.now().toString();
     activeBroadcasts.set(broadcastId, { stop: false, sent: 0, failed: 0, total: archivedChats.length, accountId });
 
-    const estimatedMin = Math.ceil(archivedChats.length * (FIXED_DELAY / 60000));
+    const broadcastDelay = getBroadcastDelay(accountId);
+    const estimatedMin = Math.ceil(archivedChats.length * (broadcastDelay / 60000));
     const hours = Math.floor(estimatedMin / 60);
     const mins = estimatedMin % 60;
 
@@ -2090,7 +2327,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       `🔔 *Рассылка началась!*\n\n` +
       `📱 Аккаунт: ${acc.name || acc.phone}\n` +
       `📊 Найдено: ${archivedChats.length} чатов\n   👥 Групп: ${groups.length}\n   👤 Диалогов: ${individuals.length}\n\n` +
-      `🛡️ *Защита:*\n   ⏱ Задержка: 10 мин (фиксированная)\n   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n\n` +
+      `🛡️ *Защита:*\n   ⏱ Задержка: ${acc.broadcastDelay} мин (±1 мин)\n   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n\n` +
       `⏱ Примерное время: ~${hours}ч ${mins}мин\n\n` +
       `⏳ Рассылка по кругу пока не остановите...\n` +
       `🛑 Для остановки нажмите "⏹ Стоп"`,
@@ -2106,6 +2343,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       const broadcast = activeBroadcasts.get(broadcastId);
       if (broadcast?.stop) {
         isBroadcasting = false;
+        acc.isBroadcasting = false;
         await safeReply(ctx,
           `⏹ *Рассылка остановлена*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`,
           { parse_mode: 'Markdown' }
@@ -2166,13 +2404,14 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
 
       chatIndex++;
 
-      // ФИКСИРОВАННАЯ задержка 10 минут
-      const delay = getFixedDelay();
+      // Задержка с учётом настроек аккаунта (±1 минута)
+      const delay = getBroadcastDelay(accountId);
       console.log(`Waiting ${Math.round(delay / 60000)} minutes before next message...`);
       await new Promise(r => setTimeout(r, delay));
     }
   } catch (error) {
     isBroadcasting = false;
+    acc.isBroadcasting = false;
     console.error('Broadcast error:', error);
     await safeReply(ctx, `❌ Ошибка: ${(error as Error).message}`);
   }
@@ -2182,12 +2421,23 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
   const acc = waAccounts.get(accountId);
   if (!acc || acc.status !== 'connected') return safeReply(ctx, '❌ Аккаунт не подключен');
 
+  // Проверяем, не идёт ли уже присоединение
+  if (acc.isJoining) {
+    return safeReply(ctx, '⏳ На этом аккаунте уже идёт присоединение к чатам!');
+  }
+  // NOTE: присоединение и рассылка могут идти одновременно на одном аккаунте
+
+  acc.isJoining = true;
+
   const validLinks: string[] = [];
   for (const link of links) {
     const code = extractInviteCode(link);
     if (code) validLinks.push(code);
   }
-  if (validLinks.length === 0) return safeReply(ctx, '❌ Не найдено валидных ссылок');
+  if (validLinks.length === 0) {
+    acc.isJoining = false;
+    return safeReply(ctx, '❌ Не найдено валидных ссылок');
+  }
 
   const joinId = Date.now().toString();
   activeJoins.set(joinId, { stop: false, joined: 0, failed: 0, skippedApproval: 0, total: validLinks.length, accountId });
@@ -2199,7 +2449,8 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
     `🛡️ *Логика:*\n` +
     `• Сразу вступаем (без одобрения)\n` +
     `• Требует одобрение → в pending очередь\n` +
-    `• Максимум ${MAX_PENDING_JOIN_REQUESTS} pending заявок\n\n` +
+    `• Максимум ${MAX_PENDING_JOIN_REQUESTS} pending заявок\n` +
+    `• Задержка: ${acc.joinDelay} мин (±1 мин)\n\n` +
     `⏳ Начинаем...`,
     { parse_mode: 'Markdown' }
   );
@@ -2263,6 +2514,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
         );
         activeJoins.delete(joinId);
         pendingGroupLinks.delete(accountId);
+        acc.isJoining = false;
         return;
       }
       if (result.success) {
@@ -2291,13 +2543,14 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
     }
 
     if (i < validLinks.length - 1) {
-      const delay = getRandomJoinDelay();
+      const delay = getRandomJoinDelay(accountId);
       console.log(`Waiting ${Math.round(delay / 60000)} minutes before next join...`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
 
   pendingGroupLinks.delete(accountId);
+  acc.isJoining = false;
 
   const pendingCount = getActivePendingCount(accountId);
   let finalText = `🏁 *Присоединение завершено*\n\n` +
