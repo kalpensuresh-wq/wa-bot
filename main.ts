@@ -1353,7 +1353,7 @@ for (const count of [10, 20, 30, 50]) {
     for (const acc of accStats) {
       const accData = waAccounts.get(acc.accountId);
       if (!accData || accData.status !== 'connected') {
-        await safeReply(ctx, `⚠️ Аккаунт ${acc.name || acc.phone} не подключен, пропускаем...`);
+        await safeReply(ctx, `⚠️ Аккаунт ${acc.phone} не подключен, пропускаем...`);
         continue;
       }
 
@@ -1361,7 +1361,7 @@ for (const count of [10, 20, 30, 50]) {
       const readyLinks = getReadyLinks(acc.accountId, linksForAcc);
 
       await safeReply(ctx,
-        `📱 *${acc.name || acc.phone}*\n` +
+        `📱 *${acc.phone}*\n` +
         `🔗 Ссылок для обработки: ${readyLinks.length}\n` +
         `⏳ Обрабатываем...`,
         { parse_mode: 'Markdown' }
@@ -1371,7 +1371,7 @@ for (const count of [10, 20, 30, 50]) {
         const link = readyLinks[i];
 
         if (getPendingCount(acc.accountId) >= MAX_PENDING_JOIN_REQUESTS) {
-          await safeReply(ctx, `⚠️ Достигнут лимит pending заявок для ${acc.name || acc.phone}`);
+          await safeReply(ctx, `⚠️ Достигнут лимит pending заявок для ${acc.phone}`);
           break;
         }
 
@@ -1385,7 +1385,7 @@ for (const count of [10, 20, 30, 50]) {
             accData.status = 'disconnected';
             updateLinkStatus(acc.accountId, link.inviteCode, 'failed', 'Сессия устарела');
             await safeReply(ctx,
-              `⚠️ *${acc.name || acc.phone}*: Сессия устарела!\n` +
+              `⚠️ *${acc.phone}*: Сессия устарела!\n` +
               `⏹ Остановка для этого аккаунта.\n` +
               `💡 Перейдите в "📱 Аккаунты" → "🔄 Проверить статус" или переподключите номер.`,
               { parse_mode: 'Markdown' }
@@ -1411,7 +1411,7 @@ for (const count of [10, 20, 30, 50]) {
           // Обновляем прогресс каждые 5 ссылок
           if ((i + 1) % 5 === 0 || i === readyLinks.length - 1) {
             await safeReply(ctx,
-              `📊 *${acc.name || acc.phone}*\n` +
+              `📊 *${acc.phone}*\n` +
               `🔗 ${i + 1}/${readyLinks.length}\n` +
               `✅ +${totalJoined} | ❌ +${totalFailed} | 🔔 +${totalPending}`
             );
