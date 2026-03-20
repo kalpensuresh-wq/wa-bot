@@ -72,7 +72,8 @@ function loadAccountsData(): { [id: string]: AccountData } {
 // Автоматическое восстановление аккаунтов
 async function restoreExistingAccounts(): Promise<void> {
   const savedAccounts = loadAccountsData();
-  const sessionsBasePath = process.env.WA_SESSIONS_PATH || './wa-sessions';
+  // Railway автоматически сохраняет /data между деплоями!
+  const sessionsBasePath = process.env.WA_SESSIONS_PATH || '/data/wa-sessions';
 
   for (const [accountId, accData] of Object.entries(savedAccounts)) {
     const sessionPath = `${sessionsBasePath}/${accountId}`;
@@ -1545,7 +1546,8 @@ bot.action(/^confirm_unbind_(.+)$/, async (ctx) => {
     try { await acc.client.logout(); await acc.client.destroy(); } catch (e) {}
   }
   // Удаляем ПАПКУ конкретного аккаунта (включая accountId в пути)
-  const sessionsPath = `${process.env.WA_SESSIONS_PATH || './wa-sessions'}/${accountId}`;
+  // Используем /data который Railway автоматически сохраняет между деплоями!
+  const sessionsPath = `${process.env.WA_SESSIONS_PATH || '/data/wa-sessions'}/${accountId}`;
   if (fs.existsSync(sessionsPath)) {
     fs.rmSync(sessionsPath, { recursive: true, force: true });
   }
@@ -2141,7 +2143,8 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
   await safeReply(ctx, '⏳ Создание сессии...\nЭто может занять 10-30 секунд');
 
   // УНИКАЛЬНАЯ папка для каждого аккаунта - критически важно для мультиаккаунта!
-  const sessionsPath = `${process.env.WA_SESSIONS_PATH || './wa-sessions'}/${accountId}`;
+  // Используем /data который Railway автоматически сохраняет между деплоями!
+  const sessionsPath = `${process.env.WA_SESSIONS_PATH || '/data/wa-sessions'}/${accountId}`;
   if (!fs.existsSync(sessionsPath)) {
     fs.mkdirSync(sessionsPath, { recursive: true });
   }
@@ -2701,6 +2704,25 @@ function startChromeAutoRestart() {
   }, 6 * 60 * 60 * 1000);
 }
 
+// Периодическая проверка и поддержание сессий живыми
+function startSessionKeepalive() {
+  // Каждые 15 минут проверяем все сессии
+  setInterval(async () => {
+    console.log('🔍 Checking session health...');
+    for (const [id, acc] of waAccounts) {
+      if (acc.status === 'connected' && acc.client) {
+        try {
+          // Пинг - проверяем что сессия жива
+          const state = await acc.client.getState();
+          console.log(`  ✅ Session ${id}: ${state}`);
+        } catch (e) {
+          console.log(`  ⚠️ Session ${id} might be stale: ${(e as Error).message}`);
+        }
+      }
+    }
+  }, 15 * 60 * 1000); // 15 минут
+}
+
 async function main() {
   console.log('🚀 Starting bot...');
   console.log('Admin IDs:', ADMIN_IDS);
@@ -2716,6 +2738,10 @@ async function main() {
 
   await setupBotMenu();
   startChromeAutoRestart();
+
+  // Запускаем периодическую проверку сессий для поддержания их живыми
+  startSessionKeepalive();
+
   await bot.launch();
   console.log('✅ Bot started');
 }
