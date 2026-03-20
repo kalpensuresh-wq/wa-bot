@@ -2186,30 +2186,48 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
     autoJoinPending: true
   });
 
-  let qrSent = false;
+  let qrAttempts = 0;
+  const maxQrAttempts = 3;
 
   client.on('qr', async (qr) => {
     const acc = waAccounts.get(accountId);
     if (acc?.status === 'connected') return;
-    if (!qrSent) {
-      qrSent = true;
-      try {
-        const qrDataUrl = await QRCode.toDataURL(qr);
-        const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-        const buffer = Buffer.from(base64Data, 'base64');
+
+    // QR-код меняется каждые ~60 секунд,允许最多3次重试
+    if (qrAttempts >= maxQrAttempts) {
+      console.log(`⚠️ Max QR attempts reached for ${phone}`);
+      if (ctx) {
         await safeReply(ctx,
-          '📱 *Подключение WhatsApp*\n\n' +
-          '1. Откройте WhatsApp на телефоне\n' +
-          '2. Нажмите Настройки → Связанные устройства\n' +
-          '3. Нажмите "Подключить устройство"\n' +
-          '4. Отсканируйте QR-код ниже\n\n' +
-          '⏰ QR-код действителен ~60 секунд',
+          `⏰ *Время истекло*\n\n` +
+          `QR-код действует ~60 секунд. Попробуйте снова через "📱 Аккаунты" → "📷 QR-код"`,
           { parse_mode: 'Markdown' }
         );
-        await ctx.replyWithPhoto({ source: buffer }, { caption: '📱 *Отсканируйте этот QR-код*', parse_mode: 'Markdown' });
-      } catch (e) {
-        console.error('QR send error:', e);
       }
+      return;
+    }
+
+    qrAttempts++;
+    try {
+      const qrDataUrl = await QRCode.toDataURL(qr);
+      const base64Data = qrDataUrl.replace(/^data:image\/png;base64,/, '');
+      const buffer = Buffer.from(base64Data, 'base64');
+      const attemptText = qrAttempts > 1 ? ` (попытка ${qrAttempts}/${maxQrAttempts})` : '';
+
+      if (ctx) {
+        await safeReply(ctx,
+          `📱 *Подключение WhatsApp*${attemptText}\n\n` +
+          `1. Откройте WhatsApp на телефоне\n` +
+          `2. Нажмите Настройки → Связанные устройства\n` +
+          `3. Нажмите "Подключить устройство"\n` +
+          `4. Отсканируйте QR-код ниже\n\n` +
+          `⏰ QR-код действителен ~60 секунд\n` +
+          (qrAttempts > 1 ? `⚠️ Если QR не работает, попробуйте снова позже` : ''),
+          { parse_mode: 'Markdown' }
+        );
+        await ctx.replyWithPhoto({ source: buffer }, { caption: `📱 *Отсканируйте этот QR-код*${attemptText}`, parse_mode: 'Markdown' });
+      }
+    } catch (e) {
+      console.error('QR send error:', e);
     }
   });
 
@@ -2219,24 +2237,33 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
       acc.status = 'connected';
       saveAccountsData();  // Сохраняем после подключения
     }
-    await safeReply(ctx,
-      `✅ *WhatsApp подключен!*\n\n📞 Номер: ${phone}\n\nТеперь вы можете:\n` +
-      `• Настроить текст рассылки в "Аккаунты"\n` +
-      `• Запустить рассылку в архивные чаты`,
-      { parse_mode: 'Markdown' }
-    );
+    console.log(`✅ WhatsApp account connected: ${phone}`);
+    if (ctx) {
+      await safeReply(ctx,
+        `✅ *WhatsApp подключен!*\n\n📞 Номер: ${phone}\n\nТеперь вы можете:\n` +
+        `• Настроить текст рассылки в "Аккаунты"\n` +
+        `• Запустить рассылку в архивные чаты`,
+        { parse_mode: 'Markdown' }
+      );
+    }
   });
 
   client.on('auth_failure', async (msg) => {
+    console.log(`❌ Auth failure for ${phone}: ${msg}`);
     const acc = waAccounts.get(accountId);
     if (acc) acc.status = 'disconnected';
-    await safeReply(ctx, `❌ Ошибка авторизации: ${msg}`);
+    if (ctx) {
+      await safeReply(ctx, `❌ Ошибка авторизации: ${msg}`);
+    }
   });
 
   client.on('disconnected', async () => {
+    console.log(`⚠️ Account disconnected: ${phone}`);
     const acc = waAccounts.get(accountId);
     if (acc) acc.status = 'disconnected';
-    await safeReply(ctx, `⚠️ Аккаунт отключился`);
+    if (ctx) {
+      await safeReply(ctx, `⚠️ Аккаунт отключился`);
+    }
   });
 
   try {
