@@ -894,9 +894,9 @@ const accountsMenu = (accountId?: string) => {
         buttons.push([Markup.button.callback('🔍 Просмотр чатов', `view_chats_${accountId}`)]);
       }
       buttons.push([Markup.button.callback('🔄 Проверить статус', `refresh_acc_${accountId}`)]);
-      buttons.push([Markup.button.callback('❌ Отвязать номер', `unbind_${accountId}`)]);
+      buttons.push([Markup.button.callback('X Отвязать номер', `unbind_${accountId}`)]);
     }
-    buttons.push([Markup.button.callback('◀️ Назад к списку', 'accounts'));
+    buttons.push([Markup.button.callback('< Back to list', 'accounts')]);
   } else {
     if (waAccounts.size > 0) {
       waAccounts.forEach((acc, id) => {
