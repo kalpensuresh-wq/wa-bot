@@ -613,6 +613,41 @@ function getRandomJoinDelay(): number {
   return Math.floor(Math.random() * (JOIN_DELAY_MAX - JOIN_DELAY_MIN + 1)) + JOIN_DELAY_MIN;
 }
 
+// Проверка валидности сессии WhatsApp
+async function isSessionValid(client: Client): Promise<boolean> {
+  try {
+    // Проверяем базовые свойства клиента
+    if (!client.info?.wid) {
+      return false;
+    }
+    // Пытаемся получить список чатов - если сессия валидна, это работает
+    await client.getChats();
+    return true;
+  } catch (error) {
+    const errorMsg = (error as Error)?.message || String(error);
+    // Detached Frame и другие ошибки сессии
+    if (errorMsg.includes('detached Frame') || errorMsg.includes('Evaluation failed') || errorMsg.includes('not ready')) {
+      return false;
+    }
+    // Другие ошибки могут означать что сессия ещё инициализируется
+    return false;
+  }
+}
+
+// Проверка и обновление статуса всех аккаунтов
+async function refreshAccountsStatus(): Promise<void> {
+  for (const [accountId, acc] of waAccounts) {
+    if (acc.client && acc.status === 'connected') {
+      const valid = await isSessionValid(acc.client);
+      if (!valid) {
+        acc.status = 'disconnected';
+        console.log(`⚠️ Account ${accountId} session invalid - marked as disconnected`);
+      }
+    }
+  }
+  saveAccountsData();
+}
+
 function extractInviteCode(link: string): string | null {
   const patterns = [
     /chat\.whatsapp\.com\/([a-zA-Z0-9]{20,})/i,
@@ -628,8 +663,14 @@ function extractInviteCode(link: string): string | null {
   return null;
 }
 
-async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ success: boolean; error?: string; needsApproval?: boolean; alreadyJoined?: boolean; skipped?: boolean }> {
+async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ success: boolean; error?: string; needsApproval?: boolean; alreadyJoined?: boolean; skipped?: boolean; sessionInvalid?: boolean }> {
   try {
+    // Проверяем что сессия валидна
+    if (!client.info?.wid) {
+      console.log(`  ⚠️ Session invalid - client not ready`);
+      return { success: false, error: 'Сессия неактивна', sessionInvalid: true };
+    }
+
     console.log(`  Checking/joining group with invite code: ${inviteCode}`);
     const allChats = await client.getChats();
     const existingChat = allChats.find((chat: any) =>
@@ -648,8 +689,14 @@ async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ 
     } catch (joinError: any) {
       const joinErrorMsg = joinError.message || String(joinError);
 
+      // Detached Frame - сессия стала невалидной
+      if (joinErrorMsg.includes('detached Frame') || joinErrorMsg.includes('Evaluation failed')) {
+        console.log(`  ⚠️ Session became invalid (detached Frame) - needs re-auth`);
+        return { success: false, error: 'Сессия устарела, требуется переподключение', sessionInvalid: true };
+      }
+
       // Если требуется одобрение - пропускаем чат (не подаём заявку)
-      if (joinErrorMsg.includes('approval') || joinErrorMsg.includes('join') || joinErrorMsg.includes('require') || joinErrorMsg.includes('Admin')) {
+      if (joinErrorMsg.includes('approval') || joinErrorMsg.includes('join') || joinErrorMsg.includes('require') || joinErrorMsg.includes('Admin') || joinErrorMsg.includes('401')) {
         console.log(`  ⚠️ Group requires approval - skipping`);
         return { success: false, error: 'Требуется одобрение', needsApproval: true, skipped: true };
       }
@@ -660,10 +707,15 @@ async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ 
   } catch (error: any) {
     const errorMessage = error.message || String(error);
     console.error(`  ✗ Join failed:`, errorMessage);
+
+    // Detached Frame
+    if (errorMessage.includes('detached Frame') || errorMessage.includes('Evaluation failed')) {
+      return { success: false, error: 'Сессия устарела, требуется переподключение', sessionInvalid: true };
+    }
     if (errorMessage.includes('invalid') || errorMessage.includes('expired')) {
       return { success: false, error: 'Ссылка недействительна или истекла' };
     }
-    if (errorMessage.includes('approval') || errorMessage.includes('join') || errorMessage.includes('require') || errorMessage.includes('Admin')) {
+    if (errorMessage.includes('approval') || errorMessage.includes('join') || errorMessage.includes('require') || errorMessage.includes('Admin') || errorMessage.includes('401')) {
       return { success: false, error: 'Требуется одобрение администратора', needsApproval: true };
     }
     if (errorMessage.includes('not found') || errorMessage.includes('404')) {
@@ -796,6 +848,7 @@ const accountsMenu = (accountId?: string) => {
         buttons.push([Markup.button.callback('📝 Изменить текст', `edit_msg_${accountId}`)]);
         buttons.push([Markup.button.callback('🔍 Просмотр чатов', `view_chats_${accountId}`)]);
       }
+      buttons.push([Markup.button.callback('🔄 Проверить статус', `refresh_acc_${accountId}`)]);
       buttons.push([Markup.button.callback('❌ Отвязать номер', `unbind_${accountId}`)]);
     }
     buttons.push([Markup.button.callback('◀️ Назад к списку', 'accounts')]);
@@ -806,6 +859,7 @@ const accountsMenu = (accountId?: string) => {
         const enabledEmoji = acc.enabled ? '✅' : '❌';
         buttons.push([Markup.button.callback(`${emoji} ${enabledEmoji} ${acc.name || acc.phone || id}`, `acc_${id}`)]);
       });
+      buttons.push([Markup.button.callback('🔄 Проверить все статусы', 'refresh_all_accounts')]);
     }
     buttons.push([Markup.button.callback('📷 QR-код (рекомендуется)', 'add_qr')]);
     buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
@@ -1287,26 +1341,58 @@ for (const count of [10, 20, 30, 50]) {
 
     await safeReply(ctx,
       `🚀 *Присоединение ${actualCount} ссылок*\n\n` +
-      `⏳ Распределяем между ${accStats.length} аккаунтами...`,
+      `📱 Аккаунтов: ${accStats.length}\n` +
+      `📊 Распределение: ~${Math.ceil(actualCount / accStats.length)} ссылок на аккаунт\n\n` +
+      `⏳ Начинаем процесс...`,
       { parse_mode: 'Markdown' }
     );
 
-    let totalJoined = 0, totalPending = 0, totalFailed = 0, totalAlready = 0;
+    let totalJoined = 0, totalPending = 0, totalFailed = 0, totalAlready = 0, totalSessionErrors = 0;
+    let hasSessionError = false;
 
     for (const acc of accStats) {
       const accData = waAccounts.get(acc.accountId);
-      if (!accData || accData.status !== 'connected') continue;
+      if (!accData || accData.status !== 'connected') {
+        await safeReply(ctx, `⚠️ Аккаунт ${acc.name || acc.phone} не подключен, пропускаем...`);
+        continue;
+      }
 
       const linksForAcc = Math.ceil(actualCount / accStats.length);
       const readyLinks = getReadyLinks(acc.accountId, linksForAcc);
 
+      await safeReply(ctx,
+        `📱 *${acc.name || acc.phone}*\n` +
+        `🔗 Ссылок для обработки: ${readyLinks.length}\n` +
+        `⏳ Обрабатываем...`,
+        { parse_mode: 'Markdown' }
+      );
+
       for (let i = 0; i < readyLinks.length; i++) {
         const link = readyLinks[i];
 
-        if (getPendingCount(acc.accountId) >= MAX_PENDING_JOIN_REQUESTS) continue;
+        if (getPendingCount(acc.accountId) >= MAX_PENDING_JOIN_REQUESTS) {
+          await safeReply(ctx, `⚠️ Достигнут лимит pending заявок для ${acc.name || acc.phone}`);
+          break;
+        }
 
         try {
           const result = await joinGroupByInvite(accData.client, link.inviteCode);
+
+          if (result.sessionInvalid) {
+            // Сессия устарела
+            hasSessionError = true;
+            totalSessionErrors++;
+            accData.status = 'disconnected';
+            updateLinkStatus(acc.accountId, link.inviteCode, 'failed', 'Сессия устарела');
+            await safeReply(ctx,
+              `⚠️ *${acc.name || acc.phone}*: Сессия устарела!\n` +
+              `⏹ Остановка для этого аккаунта.\n` +
+              `💡 Перейдите в "📱 Аккаунты" → "🔄 Проверить статус" или переподключите номер.`,
+              { parse_mode: 'Markdown' }
+            );
+            break;
+          }
+
           if (result.success) {
             if (result.alreadyJoined) {
               totalAlready++;
@@ -1321,6 +1407,15 @@ for (const count of [10, 20, 30, 50]) {
             totalFailed++;
             updateLinkStatus(acc.accountId, link.inviteCode, 'failed', result.error);
           }
+
+          // Обновляем прогресс каждые 5 ссылок
+          if ((i + 1) % 5 === 0 || i === readyLinks.length - 1) {
+            await safeReply(ctx,
+              `📊 *${acc.name || acc.phone}*\n` +
+              `🔗 ${i + 1}/${readyLinks.length}\n` +
+              `✅ +${totalJoined} | ❌ +${totalFailed} | 🔔 +${totalPending}`
+            );
+          }
         } catch (error) {
           totalFailed++;
           updateLinkStatus(acc.accountId, link.inviteCode, 'failed', (error as Error).message);
@@ -1331,15 +1426,20 @@ for (const count of [10, 20, 30, 50]) {
     }
 
     const newStats = getPoolStats();
-    await safeReply(ctx,
-      `🏁 *Завершено*\n\n` +
-      `✅ Присоединено: ${totalJoined}\n` +
-      `🔔 Pending: ${totalPending}\n` +
-      `❌ Ошибок: ${totalFailed}\n` +
-      `⏭️ Уже в группе: ${totalAlready}\n\n` +
-      `📊 Осталось: 🟢 ${newStats.ready} | 🔔 ${newStats.pending}`,
-      { parse_mode: 'Markdown' }
-    );
+    let finalText = `🏁 *Завершено*\n\n`;
+    finalText += `✅ Присоединено: ${totalJoined}\n`;
+    finalText += `🔔 Pending: ${totalPending}\n`;
+    finalText += `❌ Ошибок: ${totalFailed}\n`;
+    finalText += `⏭️ Уже в группе: ${totalAlready}\n`;
+    if (totalSessionErrors > 0) {
+      finalText += `⚠️ Сессий устарело: ${totalSessionErrors}\n`;
+    }
+    finalText += `\n📊 Осталось: 🟢 ${newStats.ready} | 🔔 ${newStats.pending}`;
+    if (hasSessionError) {
+      finalText += `\n\n💡 Для продолжения:\n1. Перейдите в "📱 Аккаунты"\n2. Проверьте/переподключите аккаунты с устаревшими сессиями`;
+    }
+
+    await safeReply(ctx, finalText, { parse_mode: 'Markdown' });
   });
 }
 
@@ -1457,6 +1557,51 @@ bot.action(/^view_chats_(.+)$/, async (ctx) => {
     console.error('Error getting chats:', error);
     await safeReply(ctx, '❌ Ошибка при получении чатов');
   }
+});
+
+// Проверка статуса одного аккаунта
+bot.action(/^refresh_acc_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx, 'Проверяем...');
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  const acc = waAccounts.get(accountId);
+  if (!acc) {
+    await safeEdit(ctx, '❌ Аккаунт не найден', { ...accountsMenu() });
+    return;
+  }
+
+  const wasConnected = acc.status === 'connected';
+  if (acc.client) {
+    const valid = await isSessionValid(acc.client);
+    if (valid && acc.status !== 'connected') {
+      acc.status = 'connected';
+      await safeReply(ctx, `✅ Статус обновлён: аккаунт подключен!`);
+    } else if (!valid && acc.status === 'connected') {
+      acc.status = 'disconnected';
+      await safeReply(ctx, `⚠️ Статус обновлён: аккаунт отключен (сессия устарела)`);
+    } else if (valid) {
+      await safeReply(ctx, `✅ Аккаунт подключен и активен`);
+    } else {
+      await safeReply(ctx, `🔴 Аккаунт отключен. Нажмите "❌ Отвязать номер" и подключите заново через QR.`);
+    }
+    saveAccountsData();
+  }
+  await safeEdit(ctx, `📱 *${acc.name || acc.phone}*\n\n📊 Статус: ${acc.status === 'connected' ? '🟢 Подключен' : '🔴 Отключен'}\n\nНажмите "◀️ Назад к списку"`, { parse_mode: 'Markdown', ...accountsMenu(accountId) });
+});
+
+// Проверка статуса всех аккаунтов
+bot.action('refresh_all_accounts', async (ctx) => {
+  await safeAnswerCb(ctx, 'Проверяем все аккаунты...');
+  await refreshAccountsStatus();
+  const connected = [...waAccounts.values()].filter(a => a.status === 'connected').length;
+  const total = waAccounts.size;
+  await safeEdit(ctx,
+    `🔄 *Проверка завершена*\n\n` +
+    `📱 Подключено: ${connected}/${total}\n\n` +
+    (connected === 0 ? `⚠️ Нет активных аккаунтов!\n` : '') +
+    `Нажмите "◀️ Назад" для просмотра списка`,
+    { parse_mode: 'Markdown', ...accountsMenu() }
+  );
 });
 
 // === BROADCAST ===
@@ -2100,6 +2245,26 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
 
     try {
       const result = await joinGroupByInvite(acc.client, inviteCode);
+      if (result.sessionInvalid) {
+        // Сессия устарела - останавливаем и просим переподключить
+        acc.status = 'disconnected';
+        await safeReply(ctx,
+          `⚠️ *Сессия аккаунта устарела!*\n\n` +
+          `📱 Номер: ${acc.phone}\n` +
+          `❌ Присоединено: ${joined}\n` +
+          `⏭️ Уже в группе: ${alreadyJoined}\n` +
+          `❌ Ошибок: ${failed}\n` +
+          `📋 В pending: ${addedToPending}\n\n` +
+          `🔄 Для продолжения:\n` +
+          `1. Перейдите в "📱 Аккаунты"\n` +
+          `2. Нажмите "❌ Отвязать номер"\n` +
+          `3. Подключите номер заново через QR`,
+          { parse_mode: 'Markdown' }
+        );
+        activeJoins.delete(joinId);
+        pendingGroupLinks.delete(accountId);
+        return;
+      }
       if (result.success) {
         if (result.alreadyJoined) alreadyJoined++;
         else { joined++; joinsSinceBreak++; }
@@ -2289,6 +2454,12 @@ async function main() {
 
   // Восстанавливаем существующие аккаунты
   await restoreExistingAccounts();
+
+  // Ждём немного для инициализации сессий
+  await new Promise(r => setTimeout(r, 3000));
+
+  // Проверяем и обновляем статусы аккаунтов
+  await refreshAccountsStatus();
 
   await setupBotMenu();
   startChromeAutoRestart();
