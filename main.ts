@@ -103,7 +103,10 @@ async function restoreExistingAccounts(): Promise<void> {
           '--no-zygote',
           '--single-process',
           '--disable-gpu',
+          '--disable-web-security',
+          '--disable-features=IsolateOrigins,site-per-process',
         ],
+        ignoreHTTPSErrors: true,
       },
     });
 
@@ -149,10 +152,44 @@ async function restoreExistingAccounts(): Promise<void> {
       }
     });
 
-    try {
-      await client.initialize();
-    } catch (error) {
-      console.error(`Failed to initialize ${accountId}:`, error);
+    // Задержка перед инициализацией
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Инициализация с повторными попытками
+    let initAttempts = 0;
+    const maxInitAttempts = 3;
+    let initSuccess = false;
+
+    while (initAttempts < maxInitAttempts && !initSuccess) {
+      try {
+        initAttempts++;
+        console.log(`🔄 Restoring ${accountId} (attempt ${initAttempts}/${maxInitAttempts})...`);
+        await client.initialize();
+        initSuccess = true;
+        console.log(`✅ Account ${accountId} restored successfully`);
+      } catch (error) {
+        const errorMsg = (error as Error)?.message || String(error);
+        console.error(`❌ Restore attempt ${initAttempts} failed for ${accountId}:`, errorMsg);
+
+        // Проверяем критические ошибки
+        if (errorMsg.includes('Execution context') ||
+            errorMsg.includes('detached Frame') ||
+            errorMsg.includes('Target closed') ||
+            errorMsg.includes('Protocol error')) {
+          // Пробуем снова
+          if (initAttempts < maxInitAttempts) {
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        } else {
+          // Другая ошибка - выходим
+          console.log(`⚠️ Non-recoverable error for ${accountId}, skipping`);
+          break;
+        }
+      }
+    }
+
+    if (!initSuccess) {
+      console.error(`❌ Failed to restore ${accountId} after ${maxInitAttempts} attempts`);
       const acc = waAccounts.get(accountId);
       if (acc) acc.status = 'disconnected';
     }
@@ -3132,22 +3169,38 @@ async function main() {
 
 // Глобальные обработчики ошибок для предотвращения крашей
 // Эти ошибки часто происходят в puppeteer и не должны крашить бота
+
+// Функция проверки критических ошибок puppeteer
+function isPuppeteerCriticalError(msg: string): boolean {
+  const criticalPatterns = [
+    'Execution context was destroyed',
+    'Execution context',
+    'Target closed',
+    'Protocol error',
+    'Navigation',
+    'detached Frame',
+    'TargetCrashed',
+    'Page Crashed',
+    'crashed',
+    'Session closed',
+    'Session closed',
+  ];
+  return criticalPatterns.some(pattern => msg.toLowerCase().includes(pattern.toLowerCase()));
+}
+
 process.on('uncaughtException', (error) => {
   const errorMsg = error.message || '';
   console.error('⚠️ Uncaught Exception:', errorMsg);
 
   // Execution context errors - логируем но не крашим бота
-  if (errorMsg.includes('Execution context was destroyed') ||
-      errorMsg.includes('Target closed') ||
-      errorMsg.includes('Protocol error') ||
-      errorMsg.includes('Navigation') ||
-      errorMsg.includes('detached Frame')) {
-    console.log('🔄 Ignoring navigation/execution error - session will be reconnected');
+  if (isPuppeteerCriticalError(errorMsg)) {
+    console.log('🔄 Ignoring puppeteer navigation/execution error - session will be reconnected');
     return; // Не выходим из процесса
   }
 
   // Для других ошибок - выходим
   console.error('❌ Fatal error, exiting...');
+  console.error(error.stack);
   process.exit(1);
 });
 
@@ -3156,11 +3209,8 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reasonStr);
 
   // Игнорируем известные ошибки puppeteer
-  if (reasonStr.includes('Execution context') ||
-      reasonStr.includes('Target closed') ||
-      reasonStr.includes('Navigation') ||
-      reasonStr.includes('detached Frame')) {
-    console.log('🔄 Ignoring navigation/execution rejection');
+  if (isPuppeteerCriticalError(reasonStr)) {
+    console.log('🔄 Ignoring puppeteer rejection - session will be reconnected');
     return;
   }
 });
