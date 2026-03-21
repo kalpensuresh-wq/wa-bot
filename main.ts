@@ -2515,9 +2515,12 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
     }
   });
 
+  // Небольшая задержка перед инициализацией
+  await new Promise(r => setTimeout(r, 2000));
+
   // Инициализация с повторными попытками
   let initAttempts = 0;
-  const maxInitAttempts = 3;
+  const maxInitAttempts = 2;
   let lastError: Error | null = null;
 
   while (initAttempts < maxInitAttempts) {
@@ -2542,12 +2545,12 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
         console.log(`🔄 Session stale, will retry with fresh session...`);
         // Ждём перед повторной попыткой
         if (initAttempts < maxInitAttempts) {
-          await new Promise(r => setTimeout(r, 5000)); // 5 секунд
+          await new Promise(r => setTimeout(r, 3000)); // 3 секунды
         }
       } else if (errorMsg.includes('Target closed') || errorMsg.includes('Protocol error')) {
         console.log(`🔄 Browser closed unexpectedly, retrying...`);
         if (initAttempts < maxInitAttempts) {
-          await new Promise(r => setTimeout(r, 3000));
+          await new Promise(r => setTimeout(r, 2000));
         }
       } else {
         // Другие ошибки - возможно QR код нужен
@@ -3126,6 +3129,41 @@ async function main() {
   await bot.launch();
   console.log('✅ Bot started');
 }
+
+// Глобальные обработчики ошибок для предотвращения крашей
+// Эти ошибки часто происходят в puppeteer и не должны крашить бота
+process.on('uncaughtException', (error) => {
+  const errorMsg = error.message || '';
+  console.error('⚠️ Uncaught Exception:', errorMsg);
+
+  // Execution context errors - логируем но не крашим бота
+  if (errorMsg.includes('Execution context was destroyed') ||
+      errorMsg.includes('Target closed') ||
+      errorMsg.includes('Protocol error') ||
+      errorMsg.includes('Navigation') ||
+      errorMsg.includes('detached Frame')) {
+    console.log('🔄 Ignoring navigation/execution error - session will be reconnected');
+    return; // Не выходим из процесса
+  }
+
+  // Для других ошибок - выходим
+  console.error('❌ Fatal error, exiting...');
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  const reasonStr = String(reason);
+  console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reasonStr);
+
+  // Игнорируем известные ошибки puppeteer
+  if (reasonStr.includes('Execution context') ||
+      reasonStr.includes('Target closed') ||
+      reasonStr.includes('Navigation') ||
+      reasonStr.includes('detached Frame')) {
+    console.log('🔄 Ignoring navigation/execution rejection');
+    return;
+  }
+});
 
 main().catch(console.error);
 
