@@ -1216,7 +1216,7 @@ bot.on('document', async (ctx) => {
   }
 });
 
-// === МЕНЮ ПУЛА ===
+// === МЕНЮ ПУЛА ЧАТОВ ===
 const poolMenu = () => {
   const stats = getPoolStats();
   const accStats = getAccountPoolStats();
@@ -1229,25 +1229,30 @@ const poolMenu = () => {
   text += `❌ Ошибок: ${stats.failed}\n\n`;
 
   if (accStats.length > 0) {
-    text += `📱 *По аккаунтам:*\n`;
-    accStats.forEach(acc => {
-      text += `\n📞 ${acc.phone}\n`;
-      text += `   🟢 ${acc.ready} | 🔔 ${acc.pending} | ✅ ${acc.joined}\n`;
-    });
+    text += `📱 *Выберите номер для присоединения:*\n`;
   }
 
   const buttons: any[][] = [];
 
-  if (stats.ready > 0) {
-    buttons.push([Markup.button.callback('🚀 Начать присоединение', 'pool_start_join')]);
+  // Показываем все номера с их статистикой
+  waAccounts.forEach((acc, id) => {
+    if (acc.status === 'connected') {
+      const pendingCount = getPendingCount(id);
+      const readyCount = getReadyCount(id);
+      let statusIcon = '';
+      if (acc.isJoining) statusIcon = ' 🔄';
+      else if (acc.isBroadcasting) statusIcon = ' 📤';
+      buttons.push([Markup.button.callback(
+        `📱 ${acc.name || acc.phone}${statusIcon} | 🟢${readyCount} 🔔${pendingCount}`,
+        `pool_acc_${id}`
+      )]);
+    }
+  });
+
+  if (buttons.length === 0) {
+    buttons.push([Markup.button.callback('❌ Нет подключенных аккаунтов', 'main')]);
   }
-  if (stats.pending > 0) {
-    buttons.push([Markup.button.callback('🔔 Обработать pending', 'pool_process_pending')]);
-  }
-  if (stats.joined > 0 || stats.failed > 0) {
-    buttons.push([Markup.button.callback('🗑️ Очистить обработанные', 'pool_clear_processed')]);
-  }
-  buttons.push([Markup.button.callback('🗑️ Очистить весь пул', 'pool_clear_all')]);
+
   buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
 
   return { text, buttons };
@@ -1262,22 +1267,55 @@ bot.action('pool_menu', async (ctx) => {
   });
 });
 
-bot.action('pool_start_join', async (ctx) => {
+// Выбор номера в пуле - спрашиваем количество чатов
+bot.action(/^pool_acc_(.+)$/, async (ctx) => {
   await safeAnswerCb(ctx);
-  const stats = getPoolStats();
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') {
+    await safeEdit(ctx, '❌ Аккаунт не подключен', { ...poolMenu().buttons });
+    return;
+  }
+
+  // Проверяем, не идёт ли уже процесс
+  if (acc.isJoining) {
+    await safeEdit(ctx,
+      `⏳ *Присоединение уже идёт!*\n\n` +
+      `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
+      `Используйте "📋 Pending заявки" для остановки или проверки.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [Markup.button.callback('📋 Pending заявки', 'pending_menu')],
+            [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
+          ]
+        }
+      }
+    );
+    return;
+  }
+
+  // Запрашиваем количество чатов
+  userStates.set(ctx.from!.id, { action: 'waiting_pool_join_count', accountId });
+
+  const readyCount = getReadyCount(accountId);
   await safeEdit(ctx,
-    `🚀 *Выбор количества*\n\n` +
-    `🟢 Доступно ссылок: ${stats.ready}\n\n` +
-    `Выберите количество для обработки:`,
+    `📊 *Выбор количества чатов*\n\n` +
+    `📱 Аккаунт: ${acc.name || acc.phone}\n` +
+    `🟢 Доступно в пуле: ${readyCount}\n\n` +
+    `📝 Введите количество чатов для присоединения:\n` +
+    `Например: 5, 10, 20\n\n` +
+    `🛡️ Защита от бана:\n` +
+    `• Максимум ${MAX_PENDING_JOIN_REQUESTS} pending заявок\n` +
+    `• После ${MAX_JOINS_BEFORE_BREAK} присоединений - перерыв 4 часа`,
     {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
-          [Markup.button.callback('10', 'pool_join_10')],
-          [Markup.button.callback('20', 'pool_join_20')],
-          [Markup.button.callback('30', 'pool_join_30')],
-          [Markup.button.callback('50', 'pool_join_50')],
-          [Markup.button.callback('◀️ Назад', 'pool_menu')]
+          [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
         ]
       }
     }
@@ -2103,6 +2141,107 @@ bot.on('text', async (ctx) => {
           reply_markup: {
             inline_keyboard: [
               [Markup.button.callback('◀️ Назад', 'join_menu')]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    // Ввод количества чатов из меню пула
+    if (state.action === 'waiting_pool_join_count') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      const count = parseInt(ctx.message.text.trim());
+      if (isNaN(count) || count < 1 || count > 100) {
+        await safeReply(ctx, '❌ Введите число от 1 до 100');
+        return;
+      }
+
+      // Переходим к вводу задержки
+      userStates.set(ctx.from!.id, { action: 'waiting_pool_join_delay', accountId, chatCount: count });
+
+      await safeReply(ctx,
+        `✅ Количество: ${count} чатов\n\n` +
+        `🔗 *Присоединение к чатам*\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `📊 Количество чатов: ${count}\n\n` +
+        `⏱ Введите задержку между присоединениями (в минутах):\n` +
+        `Например: 5 или 10\n\n` +
+        `±1 минута рандом будет добавлена автоматически.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    // Ввод задержки из меню пула
+    if (state.action === 'waiting_pool_join_delay') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      const delayMinutes = parseInt(ctx.message.text.trim());
+      if (isNaN(delayMinutes) || delayMinutes < 1 || delayMinutes > 60) {
+        await safeReply(ctx, '❌ Введите число от 1 до 60 минут');
+        return;
+      }
+      acc.joinDelay = delayMinutes;
+      saveAccountsData();
+
+      const chatCount = (state as any).chatCount || 10;
+
+      userStates.delete(ctx.from!.id);
+      await safeReply(ctx,
+        `✅ Настройки сохранены!\n\n` +
+        `🔗 *Присоединение к чатам*\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `📊 Количество чатов: ${chatCount}\n` +
+        `⏱ Задержка: ${delayMinutes} мин (±1 мин)\n\n` +
+        `📝 Введите ссылки на группы (${chatCount} штук через пробел).\n` +
+        `Формат: https://chat.whatsapp.com/Код`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
+            ]
+          }
+        }
+      );
+      userStates.set(ctx.from!.id, { action: 'waiting_pool_links', accountId, chatCount });
+      return;
+    }
+
+    // Ввод ссылок из меню пула
+    if (state.action === 'waiting_pool_links') {
+      const accountId = state.accountId;
+      const chatCount = (state as any).chatCount || 10;
+      const text = ctx.message.text.trim();
+      const links = text.split(/[\s\n]+/).filter(l => l.length > 0);
+
+      if (links.length === 0) {
+        await safeReply(ctx, '❌ Не найдены ссылки. Введите ссылки формата: https://chat.whatsapp.com/Код');
+        return;
+      }
+
+      pendingGroupLinks.set(accountId!, links);
+      userStates.delete(ctx.from!.id);
+
+      await safeReply(ctx,
+        `✅ Найдено ссылок: ${links.length}\n\n` +
+        `📱 Аккаунт: ${waAccounts.get(accountId!)?.name || waAccounts.get(accountId!)?.phone}\n` +
+        `📊 Количество: ${chatCount}\n\n` +
+        `Нажмите "✅ Да, начать" для присоединения к чатам.`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('✅ Да, начать', `confirm_join_${accountId}`)],
+              [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
             ]
           }
         }
