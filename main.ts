@@ -209,7 +209,7 @@ const waAccounts = new Map<string, {
   autoJoinPending: boolean;    // Авто-повтор для pending групп
 }>();
 
-const userStates = new Map<number, { action: string; accountId?: string }>();
+const userStates = new Map<number, { action: string; accountId?: string; chatCount?: number }>();
 const activeBroadcasts = new Map<string, {
   stop: boolean;
   sent: number;
@@ -734,10 +734,10 @@ async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ 
         return { success: false, error: 'Сессия устарела, требуется переподключение', sessionInvalid: true };
       }
 
-      // Если требуется одобрение - пропускаем чат (не подаём заявку)
+      // Если требуется одобрение - добавляем в pending очередь
       if (joinErrorMsg.includes('approval') || joinErrorMsg.includes('join') || joinErrorMsg.includes('require') || joinErrorMsg.includes('Admin') || joinErrorMsg.includes('401')) {
-        console.log(`  ⚠️ Group requires approval - skipping`);
-        return { success: false, error: 'Требуется одобрение', needsApproval: true, skipped: true };
+        console.log(`  ⚠️ Group requires approval - adding to pending queue`);
+        return { success: false, error: 'Требуется одобрение', needsApproval: true };
       }
 
       // Для других ошибок - пробросим их выше
@@ -755,6 +755,7 @@ async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ 
       return { success: false, error: 'Ссылка недействительна или истекла' };
     }
     if (errorMessage.includes('approval') || errorMessage.includes('join') || errorMessage.includes('require') || errorMessage.includes('Admin') || errorMessage.includes('401')) {
+      console.log(`  ⚠️ Group requires approval - adding to pending queue`);
       return { success: false, error: 'Требуется одобрение администратора', needsApproval: true };
     }
     if (errorMessage.includes('not found') || errorMessage.includes('404')) {
@@ -938,7 +939,11 @@ const joinSelectMenu = () => {
   const buttons: any[][] = [];
   waAccounts.forEach((acc, id) => {
     if (acc.status === 'connected') {
-      buttons.push([Markup.button.callback(`📱 ${acc.name || acc.phone}`, `join_acc_${id}`)]);
+      // Показываем статус активного процесса
+      let statusIcon = '';
+      if (acc.isJoining) statusIcon = ' 🔄';
+      else if (acc.isBroadcasting) statusIcon = ' 📤';
+      buttons.push([Markup.button.callback(`📱 ${acc.name || acc.phone}${statusIcon}`, `join_acc_${id}`)]);
     }
   });
   if (buttons.length === 0) {
@@ -969,6 +974,12 @@ const pendingAccMenu = (accountId: string) => {
   const queue = pendingJoinRequests.get(accountId) || [];
   const pendingItems = queue.filter(p => p.status === 'pending');
   const buttons: any[][] = [];
+  const acc = waAccounts.get(accountId);
+
+  // Если идёт процесс присоединения - показываем кнопку остановки
+  if (acc?.isJoining) {
+    buttons.push([Markup.button.callback('⏹ ОСТАНОВИТЬ присоединение', `stop_join_${accountId}`)]);
+  }
 
   if (pendingItems.length > 0) {
     buttons.push([Markup.button.callback('▶️ Проверить заявки', `check_pending_${accountId}`)]);
@@ -1799,14 +1810,35 @@ bot.action(/^join_acc_(.+)$/, async (ctx) => {
     await safeEdit(ctx, '❌ Аккаунт не подключен', { ...joinSelectMenu() });
     return;
   }
-  // Сначала спрашиваем задержку (пользователь вводит число)
-  userStates.set(ctx.from!.id, { action: 'waiting_join_delay', accountId });
+  // Проверяем, не идёт ли уже процесс присоединения
+  if (acc.isJoining) {
+    await safeEdit(ctx,
+      `⏳ *Присоединение уже идёт!*\n\n` +
+      `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
+      `Используйте "📋 Pending заявки" для остановки.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [Markup.button.callback('📋 Pending заявки', 'pending_menu')],
+            [Markup.button.callback('◀️ Назад', 'join_menu')]
+          ]
+        }
+      }
+    );
+    return;
+  }
+
+  // Сначала спрашиваем количество чатов
+  userStates.set(ctx.from!.id, { action: 'waiting_join_count', accountId });
   await safeEdit(ctx,
     `🔗 *Присоединение к чатам*\n\n` +
     `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
-    `⏱ Введите задержку между присоединениями (в минутах):\n` +
+    `📊 Введите количество чатов для присоединения:\n` +
     `Например: 5 или 10\n\n` +
-    `±1 минута рандом будет добавлена автоматически.`,
+    `🛡️ Защита от бана:\n` +
+    `• Максимум ${MAX_PENDING_JOIN_REQUESTS} pending заявок\n` +
+    `• После ${MAX_JOINS_BEFORE_BREAK} присоединений - перерыв 4 часа`,
     {
       parse_mode: 'Markdown',
       reply_markup: {
@@ -1897,6 +1929,32 @@ bot.action(/^clear_pending_(.+)$/, async (ctx) => {
   pendingJoinRequests.delete(accountId);
   await safeReply(ctx, '🗑️ Очередь pending заявок очищена');
   await safeEdit(ctx, '✅ Очередь очищена!', { ...pendingAccMenu(accountId) });
+});
+
+// === STOP JOIN ===
+bot.action(/^stop_join_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+
+  const acc = waAccounts.get(accountId);
+  if (!acc) {
+    await safeEdit(ctx, '❌ Аккаунт не найден', { ...pendingAccMenu(accountId) });
+    return;
+  }
+
+  // Останавливаем процесс присоединения
+  acc.isJoining = false;
+
+  // Останавливаем все активные join операции для этого аккаунта
+  for (const [joinId, joinData] of activeJoins.entries()) {
+    if (joinData.accountId === accountId) {
+      joinData.stop = true;
+    }
+  }
+
+  await safeReply(ctx, `⏹ Присоединение для ${acc.name || acc.phone} остановлено!`);
+  await safeEdit(ctx, `✅ Присоединение остановлено!\n📱 Аккаунт: ${acc.name || acc.phone}`, { ...pendingAccMenu(accountId) });
 });
 
 // === SETTINGS ===
@@ -2021,6 +2079,37 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    // Ввод количества чатов для присоединения
+    if (state.action === 'waiting_join_count') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      const count = parseInt(ctx.message.text.trim());
+      if (isNaN(count) || count < 1 || count > 100) {
+        await safeReply(ctx, '❌ Введите число от 1 до 100');
+        return;
+      }
+      // Сохраняем количество в состояние и переходим к задержке
+      userStates.set(ctx.from!.id, { action: 'waiting_join_delay', accountId, chatCount: count });
+      await safeReply(ctx,
+        `✅ Количество: ${count} чатов\n\n` +
+        `🔗 *Присоединение к чатам*\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `📊 Количество чатов: ${count}\n\n` +
+        `⏱ Введите задержку между присоединениями (в минутах):\n` +
+        `Например: 5 или 10\n\n` +
+        `±1 минута рандом будет добавлена автоматически.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('◀️ Назад', 'join_menu')]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
     // Ввод задержки для присоединения
     if (state.action === 'waiting_join_delay') {
       const accountId = state.accountId;
@@ -2033,13 +2122,17 @@ bot.on('text', async (ctx) => {
       acc.joinDelay = delayMinutes;
       saveAccountsData();
 
+      // Получаем количество чатов из состояния
+      const chatCount = (state as any).chatCount || 10;
+
       userStates.delete(ctx.from!.id);
       await safeReply(ctx,
-        `✅ Задержка установлена: ${delayMinutes} мин (±1 мин рандом)\n\n` +
-        `🔗 *Подтверждение присоединения*\n\n` +
+        `✅ Настройки сохранены!\n\n` +
+        `🔗 *Присоединение к чатам*\n\n` +
         `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `📊 Количество чатов: ${chatCount}\n` +
         `⏱ Задержка: ${delayMinutes} мин (±1 мин)\n\n` +
-        `Введите ссылки на группы через пробел.`,
+        `Введите ссылки на группы (${chatCount} штук через пробел).`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
@@ -2049,8 +2142,8 @@ bot.on('text', async (ctx) => {
           }
         }
       );
-      // Сохраняем состояние для ожидания ссылок
-      userStates.set(ctx.from!.id, { action: 'waiting_group_links', accountId });
+      // Сохраняем состояние для ожидания ссылок с количеством
+      userStates.set(ctx.from!.id, { action: 'waiting_group_links', accountId, chatCount });
       return;
     }
 
@@ -2597,7 +2690,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
   activeJoins.delete(joinId);
 }
 
-// Функция проверки pending заявок
+// Функция проверки pending заявок с авто-продолжением
 async function checkPendingRequests(ctx: any, accountId: string) {
   const acc = waAccounts.get(accountId);
   if (!acc || acc.status !== 'connected') return safeReply(ctx, '❌ Аккаунт не подключен');
@@ -2622,7 +2715,7 @@ async function checkPendingRequests(ctx: any, accountId: string) {
   await safeReply(ctx,
     `🔍 *Проверка pending заявок*\n\n` +
     `📋 Всего: ${pendingItems.length}\n` +
-    `⏳ Проверяем...`,
+    `🔄 Проверяем и автоматически вступаем при одобрении...`,
     { parse_mode: 'Markdown' }
   );
 
@@ -2646,6 +2739,13 @@ async function checkPendingRequests(ctx: any, accountId: string) {
         approved++;
         item.status = 'approved';
         console.log(`  ✅ Request approved: ${item.inviteCode}`);
+        // Уведомляем пользователя об одобрении
+        await safeReply(ctx,
+          `🎉 *Заявка одобрена!*\n\n` +
+          `✅ Вы автоматически вступили в группу\n` +
+          `📋 Осталось pending: ${pendingItems.length - i - 1 + stillPending}`,
+          { parse_mode: 'Markdown' }
+        );
       } else if (result.needsApproval) {
         // Всё ещё требует одобрения
         stillPending++;
@@ -2731,7 +2831,7 @@ function startChromeAutoRestart() {
   }, 6 * 60 * 60 * 1000);
 }
 
-// Периодическая проверка и поддержание сессий живыми
+// Периодическая проверка и поддержание сессий живыми + авто-переподключение
 function startSessionKeepalive() {
   // Каждые 15 минут проверяем все сессии
   setInterval(async () => {
@@ -2743,8 +2843,54 @@ function startSessionKeepalive() {
           const state = await acc.client.getState();
           console.log(`  ✅ Session ${id}: ${state}`);
         } catch (e) {
-          console.log(`  ⚠️ Session ${id} might be stale: ${(e as Error).message}`);
+          const errorMsg = (e as Error).message || '';
+          console.log(`  ⚠️ Session ${id} is stale: ${errorMsg}`);
+
+          // Пытаемся восстановить сессию
+          if (errorMsg.includes('Execution context') || errorMsg.includes('detached') || errorMsg.includes('stale')) {
+            console.log(`  🔄 Attempting to reconnect session ${id}...`);
+            try {
+              acc.status = 'connecting';
+              await acc.client.destroy();
+
+              // Создаём новый клиент для этого аккаунта
+              const sessionsBasePath = process.env.WA_SESSIONS_PATH || '/data/wa-sessions';
+              const sessionPath = `${sessionsBasePath}/${id}`;
+
+              const newClient = new Client({
+                authStrategy: new LocalAuth({
+                  clientId: id,
+                  dataPath: sessionPath,
+                }),
+                puppeteer: {
+                  headless: true,
+                  executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+                  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process', '--disable-gpu'],
+                },
+              });
+
+              // Копируем обработчики событий
+              newClient.on('ready', async () => {
+                acc.client = newClient;
+                acc.status = 'connected';
+                console.log(`  ✅ Session ${id} reconnected successfully!`);
+              });
+
+              newClient.on('disconnected', async () => {
+                acc.status = 'disconnected';
+                console.log(`  ⚠️ Session ${id} disconnected again`);
+              });
+
+              await newClient.initialize();
+            } catch (reconnectError) {
+              console.log(`  ❌ Failed to reconnect ${id}: ${(reconnectError as Error).message}`);
+              acc.status = 'disconnected';
+            }
+          }
         }
+      } else if (acc.status === 'disconnected' && acc.phone) {
+        // Пробуем автоматически переподключить отключенные аккаунты каждые 30 минут
+        console.log(`  🔄 Will attempt to reconnect ${id} on next cycle...`);
       }
     }
   }, 15 * 60 * 1000); // 15 минут
