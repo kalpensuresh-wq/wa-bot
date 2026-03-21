@@ -2377,7 +2377,21 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
   // УНИКАЛЬНАЯ папка для каждого аккаунта - критически важно для мультиаккаунта!
   // Используем /data который Railway автоматически сохраняет между деплоями!
   const sessionsPath = `${process.env.WA_SESSIONS_PATH || '/data/wa-sessions'}/${accountId}`;
-  if (!fs.existsSync(sessionsPath)) {
+
+  // Очищаем старую сессию если есть проблемы
+  if (fs.existsSync(sessionsPath)) {
+    try {
+      const sessionFiles = fs.readdirSync(sessionsPath);
+      // Если есть старый SessionFormat folder - удаляем
+      if (sessionFiles.some(f => f.includes('Session'))) {
+        console.log(`🗑️ Clearing old session for ${accountId}...`);
+        fs.rmSync(sessionsPath, { recursive: true, force: true });
+        fs.mkdirSync(sessionsPath, { recursive: true });
+      }
+    } catch (e) {
+      console.log(`⚠️ Could not clear session folder: ${e}`);
+    }
+  } else {
     fs.mkdirSync(sessionsPath, { recursive: true });
   }
 
@@ -2398,7 +2412,10 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
         '--no-zygote',
         '--single-process',
         '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
       ],
+      ignoreHTTPSErrors: true,
     },
   });
 
@@ -2498,13 +2515,65 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
     }
   });
 
-  try {
-    await client.initialize();
-  } catch (error) {
-    console.error('Initialize error:', error);
-    const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
-    await safeReply(ctx, `❌ Ошибка: ${(error as Error).message}`);
+  // Инициализация с повторными попытками
+  let initAttempts = 0;
+  const maxInitAttempts = 3;
+  let lastError: Error | null = null;
+
+  while (initAttempts < maxInitAttempts) {
+    try {
+      initAttempts++;
+      console.log(`🔄 Initializing client (attempt ${initAttempts}/${maxInitAttempts})...`);
+
+      if (ctx) {
+        await safeReply(ctx, `⏳ Попытка подключения ${initAttempts}/${maxInitAttempts}...\nЭто может занять 10-30 секунд`);
+      }
+
+      await client.initialize();
+      console.log(`✅ Client initialized successfully`);
+      return; // Успех - выходим
+    } catch (error) {
+      lastError = error as Error;
+      console.error(`❌ Initialize attempt ${initAttempts} failed:`, lastError.message);
+
+      // Проверяем тип ошибки
+      const errorMsg = lastError.message || '';
+      if (errorMsg.includes('Execution context') || errorMsg.includes('detached Frame')) {
+        console.log(`🔄 Session stale, will retry with fresh session...`);
+        // Ждём перед повторной попыткой
+        if (initAttempts < maxInitAttempts) {
+          await new Promise(r => setTimeout(r, 5000)); // 5 секунд
+        }
+      } else if (errorMsg.includes('Target closed') || errorMsg.includes('Protocol error')) {
+        console.log(`🔄 Browser closed unexpectedly, retrying...`);
+        if (initAttempts < maxInitAttempts) {
+          await new Promise(r => setTimeout(r, 3000));
+        }
+      } else {
+        // Другие ошибки - возможно QR код нужен
+        break;
+      }
+    }
+  }
+
+  // Все попытки исчерпаны
+  console.error(`❌ All ${maxInitAttempts} initialization attempts failed`);
+  const acc = waAccounts.get(accountId);
+  if (acc) acc.status = 'disconnected';
+
+  const finalMsg = lastError?.message || 'Неизвестная ошибка';
+  if (ctx) {
+    await safeReply(ctx,
+      `❌ *Ошибка подключения*\n\n` +
+      `Номер: ${phone}\n` +
+      `Ошибка: ${finalMsg.substring(0, 100)}\n\n` +
+      `💡 *Решения:*\n` +
+      `1. Откройте WhatsApp на телефоне\n` +
+      `2. Удалите связанное устройство (если есть)\n` +
+      `3. Попробуйте снова через 1-2 минуты\n\n` +
+      `Или попробуйте другой номер телефона.`,
+      { parse_mode: 'Markdown' }
+    );
   }
 }
 
