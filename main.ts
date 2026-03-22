@@ -1220,33 +1220,28 @@ bot.on('document', async (ctx) => {
 const poolMenu = () => {
   const stats = getPoolStats();
 
-  let text = '📊 *Пул чатов (ОБЩИЙ)*\n\n';
+  let text = '📊 *Пул чатов*\n\n';
   text += `📈 *Статистика пула:*\n`;
   text += `🟢 Готовы: ${stats.ready}\n`;
   text += `🔔 Pending: ${stats.pending}\n`;
   text += `✅ Присоединено: ${stats.joined}\n`;
   text += `❌ Ошибок: ${stats.failed}\n\n`;
-
-  text += `📱 *Подключенные аккаунты:* `;
-  const connected = [...waAccounts.values()].filter(a => a.status === 'connected').length;
-  text += `${connected}\n\n`;
-
-  text += `🚀 *Быстрое присоединение (РАНДОМНО):*`;
+  text += `📱 *Выберите аккаунт:*`;
 
   const buttons: any[][] = [];
 
-  // Быстрые кнопки присоединения
-  if (stats.ready > 0) {
-    buttons.push([
-      Markup.button.callback('🎲 10 чатов', 'pool_join_10'),
-      Markup.button.callback('🎲 20 чатов', 'pool_join_20')
-    ]);
-    buttons.push([
-      Markup.button.callback('🎲 30 чатов', 'pool_join_30'),
-      Markup.button.callback('🎲 50 чатов', 'pool_join_50')
-    ]);
-  } else {
-    buttons.push([Markup.button.callback('❌ Нет готовых чатов', 'main')]);
+  // Показываем все подключенные аккаунты
+  waAccounts.forEach((acc, id) => {
+    if (acc.status === 'connected') {
+      buttons.push([Markup.button.callback(
+        `📱 ${acc.name || acc.phone}`,
+        `pool_acc_${id}`
+      )]);
+    }
+  });
+
+  if (buttons.length === 0) {
+    buttons.push([Markup.button.callback('❌ Нет подключенных аккаунтов', 'main')]);
   }
 
   buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
@@ -1263,7 +1258,59 @@ bot.action('pool_menu', async (ctx) => {
   });
 });
 
-// Удаляем старый обработчик pool_acc_ (больше не нужен)
+// Выбор аккаунта -> запрос количества
+bot.action(/^pool_acc_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') {
+    await safeEdit(ctx, '❌ Аккаунт не подключен', { ...poolMenu().buttons });
+    return;
+  }
+
+  // Проверяем, не идёт ли уже процесс
+  if (acc.isJoining) {
+    await safeEdit(ctx,
+      `⏳ *Присоединение уже идёт!*\n\n` +
+      `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
+      `Используйте "📋 Pending заявки" для остановки.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [Markup.button.callback('📋 Pending заявки', 'pending_menu')],
+            [Markup.button.callback('◀️ Назад', 'pool_menu')]
+          ]
+        }
+      }
+    );
+    return;
+  }
+
+  // Запрашиваем количество чатов
+  userStates.set(ctx.from!.id, { action: 'waiting_pool_join_count', accountId });
+
+  const readyCount = getReadyCount();
+  await safeEdit(ctx,
+    `🔗 *Выбор количества*\n\n` +
+    `📱 Аккаунт: ${acc.name || acc.phone}\n` +
+    `🟢 Доступно в пуле: ${readyCount}\n\n` +
+    `📝 *Введите количество чатов:*\n` +
+    `Например: 5, 10, 20\n\n` +
+    `🛡️ Защита:\n` +
+    `• После ${MAX_JOINS_BEFORE_BREAK} присоединений - перерыв 4 часа`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('◀️ Назад', 'pool_menu')]
+        ]
+      }
+    }
+  );
+});
 
 bot.action('pool_process_pending', async (ctx) => {
   await safeAnswerCb(ctx);
@@ -2079,7 +2126,7 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    // Ввод задержки из меню пула
+    // Ввод задержки из меню пула -> автоматически берем из пула
     if (state.action === 'waiting_pool_join_delay') {
       const accountId = state.accountId;
       const acc = waAccounts.get(accountId!);
@@ -2092,62 +2139,80 @@ bot.on('text', async (ctx) => {
       saveAccountsData();
 
       const chatCount = (state as any).chatCount || 10;
-
       userStates.delete(ctx.from!.id);
-      await safeReply(ctx,
-        `✅ Настройки сохранены!\n\n` +
-        `🔗 *Присоединение к чатам*\n\n` +
-        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
-        `📊 Количество чатов: ${chatCount}\n` +
-        `⏱ Задержка: ${delayMinutes} мин (±1 мин)\n\n` +
-        `📝 Введите ссылки на группы (${chatCount} штук через пробел).\n` +
-        `Формат: https://chat.whatsapp.com/Код`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
-            ]
-          }
-        }
-      );
-      userStates.set(ctx.from!.id, { action: 'waiting_pool_links', accountId, chatCount });
-      return;
-    }
 
-    // Ввод ссылок из меню пула
-    if (state.action === 'waiting_pool_links') {
-      const accountId = state.accountId;
-      const chatCount = (state as any).chatCount || 10;
-      const text = ctx.message.text.trim();
-      const links = text.split(/[\s\n]+/).filter(l => l.length > 0);
+      // Получаем рандомные ссылки из глобального пула
+      const shuffledLinks = getReadyLinks(chatCount);
 
-      if (links.length === 0) {
-        await safeReply(ctx, '❌ Не найдены ссылки. Введите ссылки формата: https://chat.whatsapp.com/Код');
+      if (shuffledLinks.length === 0) {
+        await safeReply(ctx, '❌ В пуле нет готовых ссылок!');
         return;
       }
 
-      pendingGroupLinks.set(accountId!, links);
-      userStates.delete(ctx.from!.id);
-
       await safeReply(ctx,
-        `✅ Найдено ссылок: ${links.length}\n\n` +
-        `📱 Аккаунт: ${waAccounts.get(accountId!)?.name || waAccounts.get(accountId!)?.phone}\n` +
-        `📊 Количество: ${chatCount}\n\n` +
-        `Нажмите "✅ Да, начать" для присоединения к чатам.`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [Markup.button.callback('✅ Да, начать', `confirm_join_${accountId}`)],
-              [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
-            ]
+        `🚀 *Присоединение к чатам*\n\n` +
+        `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
+        `📊 Количество чатов: ${shuffledLinks.length}\n` +
+        `⏱ Задержка: ${delayMinutes} мин (±1 мин)\n\n` +
+        `⏳ Начинаем присоединение...`,
+        { parse_mode: 'Markdown' }
+      );
+
+      // Запускаем процесс присоединения
+      let totalJoined = 0, totalPending = 0, totalFailed = 0, totalAlready = 0;
+
+      for (let i = 0; i < shuffledLinks.length; i++) {
+        const link = shuffledLinks[i];
+
+        try {
+          const result = await joinGroupByInvite(acc!.client, link.inviteCode);
+
+          if (result.success) {
+            if (result.alreadyJoined) {
+              totalAlready++;
+            } else {
+              totalJoined++;
+            }
+            updateLinkStatus(link.inviteCode, 'joined');
+          } else if (result.needsApproval) {
+            totalPending++;
+            updateLinkStatus(link.inviteCode, 'pending');
+          } else {
+            totalFailed++;
+            updateLinkStatus(link.inviteCode, 'failed', result.error);
           }
+
+          // Обновляем прогресс каждые 3 ссылки
+          if ((i + 1) % 3 === 0 || i === shuffledLinks.length - 1) {
+            await safeReply(ctx,
+              `📊 Прогресс: ${i + 1}/${shuffledLinks.length}\n` +
+              `✅ ${totalJoined} | ❌ ${totalFailed} | 🔔 ${totalPending}`
+            );
+          }
+        } catch (error) {
+          totalFailed++;
+          updateLinkStatus(link.inviteCode, 'failed', (error as Error).message);
         }
+
+        // Задержка между присоединениями
+        const randomDelay = (delayMinutes * 60000) + (Math.random() * 60000 - 30000);
+        await new Promise(r => setTimeout(r, Math.max(30000, randomDelay)));
+      }
+
+      const newStats = getPoolStats();
+      await safeReply(ctx,
+        `🏁 *Завершено*\n\n` +
+        `✅ Присоединено: ${totalJoined}\n` +
+        `🔔 Pending: ${totalPending}\n` +
+        `❌ Ошибок: ${totalFailed}\n` +
+        `⏭️ Уже в группе: ${totalAlready}\n\n` +
+        `📊 Осталось в пуле: 🟢 ${newStats.ready}`,
+        { parse_mode: 'Markdown' }
       );
       return;
     }
 
-    // Ввод задержки для присоединения
+    // Ввод задержки для присоединения (старый метод)
     if (state.action === 'waiting_join_delay') {
       const accountId = state.accountId;
       const acc = waAccounts.get(accountId!);
