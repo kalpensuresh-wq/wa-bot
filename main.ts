@@ -260,7 +260,7 @@ const isAdmin = (userId: number) => ADMIN_IDS.includes(userId);
 
 // === КОНФИГУРАЦИЯ АНТИ-БАНА ===
 const FIXED_DELAY = 10 * 60 * 1000;  // ФИКСИРОВАННЫЕ 10 минут
-const MAX_MESSAGES_PER_DAY = 150;
+const MAX_MESSAGES_PER_DAY = 999999; // ЛИМИТ ОТКЛЮЧЁН
 const NIGHT_PAUSE_START = 24;       // Отключена
 const NIGHT_PAUSE_END = 24;
 
@@ -1489,17 +1489,19 @@ for (const count of [10, 20, 30, 50]) {
       }
 
       const linksForAcc = Math.ceil(actualCount / accStats.length);
-      const readyLinks = getReadyLinks(acc.accountId, linksForAcc);
+      // Получаем рандомные ссылки для этого аккаунта
+      const allReadyLinks = getReadyLinks(acc.accountId, 1000); // Получаем все
+      const shuffledLinks = shuffleArray(allReadyLinks).slice(0, linksForAcc);
 
       await safeReply(ctx,
         `📱 *${acc.phone}*\n` +
-        `🔗 Ссылок для обработки: ${readyLinks.length}\n` +
+        `🎯 Рандомных для обработки: ${shuffledLinks.length}\n` +
         `⏳ Обрабатываем...`,
         { parse_mode: 'Markdown' }
       );
 
-      for (let i = 0; i < readyLinks.length; i++) {
-        const link = readyLinks[i];
+      for (let i = 0; i < shuffledLinks.length; i++) {
+        const link = shuffledLinks[i];
 
         if (getPendingCount(acc.accountId) >= MAX_PENDING_JOIN_REQUESTS) {
           await safeReply(ctx, `⚠️ Достигнут лимит pending заявок для ${acc.phone}`);
@@ -1540,10 +1542,10 @@ for (const count of [10, 20, 30, 50]) {
           }
 
           // Обновляем прогресс каждые 5 ссылок
-          if ((i + 1) % 5 === 0 || i === readyLinks.length - 1) {
+          if ((i + 1) % 5 === 0 || i === shuffledLinks.length - 1) {
             await safeReply(ctx,
               `📊 *${acc.phone}*\n` +
-              `🔗 ${i + 1}/${readyLinks.length}\n` +
+              `🔗 ${i + 1}/${shuffledLinks.length}\n` +
               `✅ +${totalJoined} | ❌ +${totalFailed} | 🔔 +${totalPending}`
             );
           }
@@ -2698,7 +2700,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       `🔔 *Рассылка началась!*\n\n` +
       `📱 Аккаунт: ${acc.name || acc.phone}\n` +
       `📊 Найдено: ${archivedChats.length} чатов\n   👥 Групп: ${groups.length}\n   👤 Диалогов: ${individuals.length}\n\n` +
-      `🛡️ *Защита:*\n   ⏱ Задержка: ${acc.broadcastDelay} мин (±1 мин)\n   📊 Лимит/день: ${MAX_MESSAGES_PER_DAY}\n\n` +
+      `🛡️ *Защита:*\n   ⏱ Задержка: ${acc.broadcastDelay} мин (±1 мин)\n   📊 Лимит: БЕЗ ОГРАНИЧЕНИЙ\n\n` +
       `⏱ Примерное время: ~${hours}ч ${mins}мин\n\n` +
       `⏳ Рассылка по кругу пока не остановите...\n` +
       `🛑 Для остановки нажмите "⏹ Стоп"`,
@@ -2716,7 +2718,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
         isBroadcasting = false;
         acc.isBroadcasting = false;
         await safeReply(ctx,
-          `⏹ *Рассылка остановлена*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`,
+          `⏹ *Рассылка остановлена*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}`,
           { parse_mode: 'Markdown' }
         );
         activeBroadcasts.delete(broadcastId);
@@ -2724,11 +2726,8 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       }
 
       if (acc.sentToday >= MAX_MESSAGES_PER_DAY) {
-        await safeReply(ctx,
-          `⚠️ *Достигнут дневной лимит*\n\nОтправлено сегодня: ${acc.sentToday}\nМаксимум: ${MAX_MESSAGES_PER_DAY}\n\n⏳ Ожидаем сброса лимита...`,
-          { parse_mode: 'Markdown' }
-        );
-        await new Promise(r => setTimeout(r, 60 * 60 * 1000));
+        // Этот код теперь не выполнится т.к. лимит отключён
+        // Но оставим для совместимости
         continue;
       }
 
@@ -2736,7 +2735,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
         chatIndex = 0;
         loopCount++;
         await safeReply(ctx,
-          `🔄 *Новый круг рассылки #${loopCount + 1}*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`,
+          `🔄 *Новый круг рассылки #${loopCount + 1}*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}`,
           { parse_mode: 'Markdown' }
         );
       }
@@ -2765,7 +2764,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
           await safeReply(ctx,
             `📊 Круг ${loopCount + 1} | Сообщение ${chatIndex + 1}/${archivedChats.length}\n` +
             `✅ ${sent} | ❌ ${failed}\n` +
-            `📊 За сегодня: ${acc.sentToday}/${MAX_MESSAGES_PER_DAY}`
+            `📊 За сегодня: ${acc.sentToday}`
           );
         }
       } catch (error) {
@@ -2788,7 +2787,17 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
   }
 }
 
-async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
+// Функция для перемешивания массива (Fisher-Yates)
+function shuffleArray<T>(array: T[]): T[] {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
+async function startJoinProcess(ctx: any, accountId: string, links: string[], maxToJoin?: number) {
   const acc = waAccounts.get(accountId);
   if (!acc || acc.status !== 'connected') return safeReply(ctx, '❌ Аккаунт не подключен');
 
@@ -2810,14 +2819,28 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
     return safeReply(ctx, '❌ Не найдено валидных ссылок');
   }
 
+  // Перемешиваем ссылки для рандомного выбора
+  const shuffledLinks = shuffleArray(validLinks);
+
+  // Если указано maxToJoin - берём только нужное количество
+  const linksToJoin = maxToJoin ? shuffledLinks.slice(0, maxToJoin) : shuffledLinks;
+
+  // Сохраняем оригинальные ссылки для pending
+  const linksMap = new Map<string, string>();
+  for (let i = 0; i < validLinks.length; i++) {
+    linksMap.set(validLinks[i], links[i]);
+  }
+
   const joinId = Date.now().toString();
-  activeJoins.set(joinId, { stop: false, joined: 0, failed: 0, skippedApproval: 0, total: validLinks.length, accountId });
+  activeJoins.set(joinId, { stop: false, joined: 0, failed: 0, skippedApproval: 0, total: linksToJoin.length, accountId });
 
   await safeReply(ctx,
     `🔗 *Присоединение к чатам*\n\n` +
     `📱 Аккаунт: ${acc.name || acc.phone}\n` +
-    `📊 Найдено ссылок: ${validLinks.length}\n\n` +
+    `📊 Всего в пуле: ${validLinks.length}\n` +
+    `🎯 Выбрано для присоединения: ${linksToJoin.length}\n\n` +
     `🛡️ *Логика:*\n` +
+    `• Рандомный выбор из пула\n` +
     `• Сразу вступаем (без одобрения)\n` +
     `• Требует одобрение → в pending очередь\n` +
     `• Максимум ${MAX_PENDING_JOIN_REQUESTS} pending заявок\n` +
@@ -2828,7 +2851,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
 
   let joined = 0, alreadyJoined = 0, failed = 0, addedToPending = 0, joinsSinceBreak = 0;
 
-  for (let i = 0; i < validLinks.length; i++) {
+  for (let i = 0; i < linksToJoin.length; i++) {
     const join = activeJoins.get(joinId);
     if (join?.stop) {
       await safeReply(ctx, `⏹ Остановлено\n✅ Присоединено: ${joined} | ❌ Ошибок: ${failed} | 📋 В pending: ${addedToPending}`);
@@ -2850,7 +2873,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
     const currentPending = getActivePendingCount(accountId);
     if (currentPending >= MAX_PENDING_JOIN_REQUESTS) {
       // Превышен лимит pending - пропускаем остальные ссылки
-      const remaining = validLinks.length - i;
+      const remaining = linksToJoin.length - i;
       await safeReply(ctx,
         `⚠️ *Лимит pending заявок достигнут (${MAX_PENDING_JOIN_REQUESTS})*\n\n` +
         `📋 Осталось ссылок: ${remaining}\n` +
@@ -2862,8 +2885,8 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
       break;
     }
 
-    const inviteCode = validLinks[i];
-    console.log(`[${i+1}/${validLinks.length}] Joining: ${inviteCode} (pending: ${currentPending}/${MAX_PENDING_JOIN_REQUESTS})`);
+    const inviteCode = linksToJoin[i];
+    console.log(`[${i+1}/${linksToJoin.length}] Joining: ${inviteCode} (pending: ${currentPending}/${MAX_PENDING_JOIN_REQUESTS})`);
 
     try {
       const result = await joinGroupByInvite(acc.client, inviteCode);
@@ -2893,16 +2916,17 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
         else { joined++; joinsSinceBreak++; }
       } else if (result.needsApproval) {
         // Чат требует одобрения - добавляем в pending очередь
-        addToPendingQueue(accountId, inviteCode, links[i]);
+        const fullLink = linksMap.get(inviteCode) || `https://chat.whatsapp.com/${inviteCode}`;
+        addToPendingQueue(accountId, inviteCode, fullLink);
         addedToPending++;
         console.log(`  📋 Added to pending queue`);
       } else {
         failed++;
       }
 
-      if (i % 3 === 0 || i === validLinks.length - 1) {
+      if (i % 3 === 0 || i === linksToJoin.length - 1) {
         await safeReply(ctx,
-          `📊 ${i + 1}/${validLinks.length}\n` +
+          `📊 ${i + 1}/${linksToJoin.length}\n` +
           `✅ Присоединено: ${joined}\n` +
           `⏭️ Уже в группе: ${alreadyJoined}\n` +
           `❌ Ошибок: ${failed}\n` +
@@ -2913,7 +2937,7 @@ async function startJoinProcess(ctx: any, accountId: string, links: string[]) {
       failed++;
     }
 
-    if (i < validLinks.length - 1) {
+    if (i < linksToJoin.length - 1) {
       const delay = getRandomJoinDelay(accountId);
       console.log(`Waiting ${Math.round(delay / 60000)} minutes before next join...`);
       await new Promise(r => setTimeout(r, delay));
