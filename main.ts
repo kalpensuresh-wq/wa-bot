@@ -300,7 +300,7 @@ const activePendingProcessor = new Map<string, {
   rejected: number;
 }>();
 
-// === СИСТЕМА ПЕРСИСТЕНТНОГО ПУЛА ===
+// === СИСТЕМА ПЕРСИСТЕНТНОГО ПУЛА (ЕДИНЫЙ ПУЛ ДЛЯ ВСЕХ АККАУНТОВ) ===
 const POOL_FILE_PATH = process.env.POOL_FILE_PATH || './data/pool.json';
 
 interface PoolLink {
@@ -309,20 +309,12 @@ interface PoolLink {
   status: 'ready' | 'pending' | 'joined' | 'failed';
   addedAt: string;
   processedAt?: string;
-  accountId?: string;
   error?: string;
 }
 
 interface Pool {
   version: number;
-  accounts: {
-    [accountId: string]: {
-      ready: PoolLink[];
-      pending: PoolLink[];
-      joined: PoolLink[];
-      failed: PoolLink[];
-    };
-  };
+  links: PoolLink[];  // Единый массив для всех ссылок
   globalStats: {
     total: number;
     ready: number;
@@ -335,8 +327,8 @@ interface Pool {
 // Инициализация пула
 function initPool(): Pool {
   return {
-    version: 1,
-    accounts: {},
+    version: 2, // Обновленная версия
+    links: [],
     globalStats: {
       total: 0,
       ready: 0,
@@ -352,7 +344,38 @@ function loadPool(): Pool {
   try {
     if (fs.existsSync(POOL_FILE_PATH)) {
       const data = fs.readFileSync(POOL_FILE_PATH, 'utf-8');
-      return JSON.parse(data);
+      const pool = JSON.parse(data);
+
+      // Миграция с версии 1 (accounts-based) на версию 2 (global)
+      if (pool.version === 1) {
+        console.log('🔄 Migrating pool from v1 to v2...');
+        const newPool = initPool();
+        // Собираем все ready ссылки из всех аккаунтов
+        for (const accountId in pool.accounts) {
+          const acc = pool.accounts[accountId];
+          if (acc.ready) {
+            newPool.links.push(...acc.ready);
+            newPool.globalStats.ready += acc.ready.length;
+          }
+          if (acc.pending) {
+            newPool.links.push(...acc.pending);
+            newPool.globalStats.pending += acc.pending.length;
+          }
+          if (acc.joined) {
+            newPool.links.push(...acc.joined);
+            newPool.globalStats.joined += acc.joined.length;
+          }
+          if (acc.failed) {
+            newPool.links.push(...acc.failed);
+            newPool.globalStats.failed += acc.failed.length;
+          }
+        }
+        newPool.globalStats.total = newPool.links.length;
+        savePool(newPool);
+        return newPool;
+      }
+
+      return pool;
     }
   } catch (error) {
     console.error('Error loading pool:', error);
@@ -376,45 +399,32 @@ function savePool(pool: Pool): void {
 // Глобальный пул (в памяти)
 let globalPool: Pool = loadPool();
 
-// Инициализировать аккаунт в пуле
-function initAccountInPool(accountId: string): void {
-  if (!globalPool.accounts[accountId]) {
-    globalPool.accounts[accountId] = {
-      ready: [],
-      pending: [],
-      joined: [],
-      failed: []
-    };
+// Пересчитать статистику пула
+function recalculatePoolStats(): void {
+  globalPool.globalStats = {
+    total: globalPool.links.length,
+    ready: 0,
+    pending: 0,
+    joined: 0,
+    failed: 0
+  };
+  for (const link of globalPool.links) {
+    globalPool.globalStats[link.status]++;
   }
 }
 
-// Добавить ссылки в пул (для всех аккаунтов)
+// Добавить ссылки в глобальный пул
 function addLinksToPool(links: string[]): { added: number; duplicates: number } {
   let added = 0;
   let duplicates = 0;
 
   // Собираем все существующие коды
   const existingCodes = new Set<string>();
-  for (const accId in globalPool.accounts) {
-    const acc = globalPool.accounts[accId];
-    acc.ready.forEach(l => existingCodes.add(l.inviteCode));
-    acc.pending.forEach(l => existingCodes.add(l.inviteCode));
-    acc.joined.forEach(l => existingCodes.add(l.inviteCode));
-    acc.failed.forEach(l => existingCodes.add(l.inviteCode));
+  for (const link of globalPool.links) {
+    existingCodes.add(link.inviteCode);
   }
 
-  // Получаем все подключенные аккаунты
-  const connectedAccounts = [...waAccounts.entries()]
-    .filter(([_, a]) => a.status === 'connected')
-    .map(([id, _]) => id);
-
-  if (connectedAccounts.length === 0) {
-    return { added: 0, duplicates: 0 };
-  }
-
-  // Распределяем ссылки между аккаунтами
-  for (let i = 0; i < links.length; i++) {
-    const link = links[i];
+  for (const link of links) {
     const code = extractInviteCode(link);
 
     if (!code) continue;
@@ -424,10 +434,6 @@ function addLinksToPool(links: string[]): { added: number; duplicates: number } 
       continue;
     }
 
-    // Выбираем аккаунт по round-robin
-    const accountId = connectedAccounts[i % connectedAccounts.length];
-    initAccountInPool(accountId);
-
     const poolLink: PoolLink = {
       inviteCode: code,
       fullLink: link,
@@ -435,7 +441,7 @@ function addLinksToPool(links: string[]): { added: number; duplicates: number } 
       addedAt: new Date().toISOString()
     };
 
-    globalPool.accounts[accountId].ready.push(poolLink);
+    globalPool.links.push(poolLink);
     globalPool.globalStats.total++;
     globalPool.globalStats.ready++;
     existingCodes.add(code);
@@ -451,103 +457,60 @@ function getPoolStats(): { total: number; ready: number; pending: number; joined
   return { ...globalPool.globalStats };
 }
 
-// Получить ссылки для обработки
-function getReadyLinks(accountId: string, count: number): PoolLink[] {
-  initAccountInPool(accountId);
-  const ready = globalPool.accounts[accountId].ready;
-  // Берем рандомные ссылки
-  const shuffled = [...ready].sort(() => Math.random() - 0.5);
+// Получить ссылки для обработки (РАНДОМНО из глобального пула)
+function getReadyLinks(count: number): PoolLink[] {
+  const readyLinks = globalPool.links.filter(l => l.status === 'ready');
+  // Рандомно перемешиваем
+  const shuffled = shuffleArray(readyLinks);
   return shuffled.slice(0, Math.min(count, shuffled.length));
 }
 
 // Обновить статус ссылки
-function updateLinkStatus(accountId: string, inviteCode: string, status: PoolLink['status'], error?: string): void {
-  const acc = globalPool.accounts[accountId];
-  if (!acc) return;
-
-  // Найти ссылку
-  let link: PoolLink | undefined;
-  let sourceArray: PoolLink[] | undefined;
-
-  for (const arr of [acc.ready, acc.pending, acc.joined, acc.failed]) {
-    const found = arr.find(l => l.inviteCode === inviteCode);
-    if (found) {
-      link = found;
-      sourceArray = arr;
-      break;
-    }
-  }
-
-  if (!link || !sourceArray) return;
-
-  // Удалить из старого массива
-  const idx = sourceArray.findIndex(l => l.inviteCode === inviteCode);
-  if (idx > -1) sourceArray.splice(idx, 1);
+function updateLinkStatus(inviteCode: string, status: PoolLink['status'], error?: string): void {
+  const link = globalPool.links.find(l => l.inviteCode === inviteCode);
+  if (!link) return;
 
   // Обновить глобальную статистику
   globalPool.globalStats[link.status]--;
 
-  // Добавить в новый массив
+  // Обновить статус
   link.status = status;
   link.processedAt = new Date().toISOString();
-  link.accountId = accountId;
   if (error) link.error = error;
 
-  globalPool.accounts[accountId][status].push(link);
   globalPool.globalStats[status]++;
 
   savePool(globalPool);
 }
 
-// Получить pending ссылки аккаунта
-function getAccountPendingLinks(accountId: string): PoolLink[] {
-  initAccountInPool(accountId);
-  return globalPool.accounts[accountId].pending;
+// Получить все pending ссылки
+function getAllPendingLinks(): PoolLink[] {
+  return globalPool.links.filter(l => l.status === 'pending');
 }
 
-// Количество ready ссылок
-function getReadyCount(accountId: string): number {
-  initAccountInPool(accountId);
-  return globalPool.accounts[accountId].ready.length;
+// Количество ready ссылок в глобальном пуле
+function getReadyCount(): number {
+  return globalPool.globalStats.ready;
 }
 
-// Количество pending ссылок
-function getPendingCount(accountId: string): number {
-  initAccountInPool(accountId);
-  return globalPool.accounts[accountId].pending.length;
+// Количество pending ссылок в глобальном пуле
+function getPendingCount(): number {
+  return globalPool.globalStats.pending;
 }
 
-// Получить всех connected аккаунтов с их статистикой
-function getAccountPoolStats(): { accountId: string; phone: string; ready: number; pending: number; joined: number; failed: number }[] {
-  const stats: { accountId: string; phone: string; ready: number; pending: number; joined: number; failed: number }[] = [];
-
-  waAccounts.forEach((acc, id) => {
-    if (acc.status === 'connected') {
-      initAccountInPool(id);
-      const accPool = globalPool.accounts[id];
-      stats.push({
-        accountId: id,
-        phone: acc.phone || acc.name || id,
-        ready: accPool.ready.length,
-        pending: accPool.pending.length,
-        joined: accPool.joined.length,
-        failed: accPool.failed.length
-      });
-    }
-  });
-
-  return stats;
+// Получить статистику глобального пула
+function getGlobalPoolStats(): { ready: number; pending: number; joined: number; failed: number; total: number } {
+  return { ...globalPool.globalStats };
 }
 
 // Очистить пул (только processed = joined + failed)
 function clearProcessedPool(): void {
-  for (const accId in globalPool.accounts) {
-    const acc = globalPool.accounts[accId];
-    globalPool.globalStats.joined -= acc.joined.length;
-    globalPool.globalStats.failed -= acc.failed.length;
-    acc.joined = [];
-    acc.failed = [];
+  const toRemove = globalPool.links.filter(l => l.status === 'joined' || l.status === 'failed');
+  for (const link of toRemove) {
+    globalPool.globalStats[link.status]--;
   }
+  globalPool.links = globalPool.links.filter(l => l.status !== 'joined' && l.status !== 'failed');
+  globalPool.globalStats.total = globalPool.links.length;
   savePool(globalPool);
 }
 
@@ -1256,38 +1219,34 @@ bot.on('document', async (ctx) => {
 // === МЕНЮ ПУЛА ЧАТОВ ===
 const poolMenu = () => {
   const stats = getPoolStats();
-  const accStats = getAccountPoolStats();
 
-  let text = '📊 *Пул чатов*\n\n';
-  text += `📈 *Общая статистика:*\n`;
+  let text = '📊 *Пул чатов (ОБЩИЙ)*\n\n';
+  text += `📈 *Статистика пула:*\n`;
   text += `🟢 Готовы: ${stats.ready}\n`;
   text += `🔔 Pending: ${stats.pending}\n`;
   text += `✅ Присоединено: ${stats.joined}\n`;
   text += `❌ Ошибок: ${stats.failed}\n\n`;
 
-  if (accStats.length > 0) {
-    text += `📱 *Выберите номер для присоединения:*\n`;
-  }
+  text += `📱 *Подключенные аккаунты:* `;
+  const connected = [...waAccounts.values()].filter(a => a.status === 'connected').length;
+  text += `${connected}\n\n`;
+
+  text += `🚀 *Быстрое присоединение (РАНДОМНО):*`;
 
   const buttons: any[][] = [];
 
-  // Показываем все номера с их статистикой
-  waAccounts.forEach((acc, id) => {
-    if (acc.status === 'connected') {
-      const pendingCount = getPendingCount(id);
-      const readyCount = getReadyCount(id);
-      let statusIcon = '';
-      if (acc.isJoining) statusIcon = ' 🔄';
-      else if (acc.isBroadcasting) statusIcon = ' 📤';
-      buttons.push([Markup.button.callback(
-        `📱 ${acc.name || acc.phone}${statusIcon} | 🟢${readyCount} 🔔${pendingCount}`,
-        `pool_acc_${id}`
-      )]);
-    }
-  });
-
-  if (buttons.length === 0) {
-    buttons.push([Markup.button.callback('❌ Нет подключенных аккаунтов', 'main')]);
+  // Быстрые кнопки присоединения
+  if (stats.ready > 0) {
+    buttons.push([
+      Markup.button.callback('🎲 10 чатов', 'pool_join_10'),
+      Markup.button.callback('🎲 20 чатов', 'pool_join_20')
+    ]);
+    buttons.push([
+      Markup.button.callback('🎲 30 чатов', 'pool_join_30'),
+      Markup.button.callback('🎲 50 чатов', 'pool_join_50')
+    ]);
+  } else {
+    buttons.push([Markup.button.callback('❌ Нет готовых чатов', 'main')]);
   }
 
   buttons.push([Markup.button.callback('◀️ Назад', 'main')]);
@@ -1304,73 +1263,20 @@ bot.action('pool_menu', async (ctx) => {
   });
 });
 
-// Выбор номера в пуле - спрашиваем количество чатов
-bot.action(/^pool_acc_(.+)$/, async (ctx) => {
-  await safeAnswerCb(ctx);
-  const accountId = ctx.match?.[1];
-  if (!accountId) return;
-
-  const acc = waAccounts.get(accountId);
-  if (!acc || acc.status !== 'connected') {
-    await safeEdit(ctx, '❌ Аккаунт не подключен', { ...poolMenu().buttons });
-    return;
-  }
-
-  // Проверяем, не идёт ли уже процесс
-  if (acc.isJoining) {
-    await safeEdit(ctx,
-      `⏳ *Присоединение уже идёт!*\n\n` +
-      `📱 Аккаунт: ${acc.name || acc.phone}\n\n` +
-      `Используйте "📋 Pending заявки" для остановки или проверки.`,
-      {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [Markup.button.callback('📋 Pending заявки', 'pending_menu')],
-            [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
-          ]
-        }
-      }
-    );
-    return;
-  }
-
-  // Запрашиваем количество чатов
-  userStates.set(ctx.from!.id, { action: 'waiting_pool_join_count', accountId });
-
-  const readyCount = getReadyCount(accountId);
-  await safeEdit(ctx,
-    `📊 *Выбор количества чатов*\n\n` +
-    `📱 Аккаунт: ${acc.name || acc.phone}\n` +
-    `🟢 Доступно в пуле: ${readyCount}\n\n` +
-    `📝 Введите количество чатов для присоединения:\n` +
-    `Например: 5, 10, 20\n\n` +
-    `🛡️ Защита от бана:\n` +
-    `• Максимум ${MAX_PENDING_JOIN_REQUESTS} pending заявок\n` +
-    `• После ${MAX_JOINS_BEFORE_BREAK} присоединений - перерыв 4 часа`,
-    {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [Markup.button.callback('◀️ Назад в пул', 'pool_menu')]
-        ]
-      }
-    }
-  );
-});
+// Удаляем старый обработчик pool_acc_ (больше не нужен)
 
 bot.action('pool_process_pending', async (ctx) => {
   await safeAnswerCb(ctx);
-  const accStats = getAccountPoolStats();
-
-  if (accStats.length === 0) {
-    await safeReply(ctx, '❌ Нет подключенных аккаунтов');
-    return;
-  }
 
   const stats = getPoolStats();
   if (stats.pending === 0) {
     await safeReply(ctx, '📭 Нет pending заявок');
+    return;
+  }
+
+  const connectedAccounts = [...waAccounts.entries()].filter(([_, a]) => a.status === 'connected');
+  if (connectedAccounts.length === 0) {
+    await safeReply(ctx, '❌ Нет подключенных аккаунтов');
     return;
   }
 
@@ -1379,31 +1285,26 @@ bot.action('pool_process_pending', async (ctx) => {
   let totalApproved = 0;
   let totalRejected = 0;
 
-  for (const acc of accStats) {
-    if (acc.pending === 0) continue;
-    const accData = waAccounts.get(acc.accountId);
-    if (!accData || accData.status !== 'connected') continue;
+  const pendingLinks = getAllPendingLinks();
 
-    const pendingLinks = getAccountPendingLinks(acc.accountId);
+  for (const link of pendingLinks) {
+    // Выбираем случайный аккаунт
+    const [accountId, accData] = connectedAccounts[Math.floor(Math.random() * connectedAccounts.length)];
 
-    for (const link of pendingLinks) {
-      try {
-        const result = await joinGroupByInvite(accData.client, link.inviteCode);
-        if (result.success) {
-          updateLinkStatus(acc.accountId, link.inviteCode, 'joined');
-          totalApproved++;
-        } else if (result.needsApproval) {
-          // Оставляем pending
-        } else {
-          updateLinkStatus(acc.accountId, link.inviteCode, 'failed', result.error);
-          totalRejected++;
-        }
-      } catch (error) {
-        updateLinkStatus(acc.accountId, link.inviteCode, 'failed', (error as Error).message);
+    try {
+      const result = await joinGroupByInvite(accData.client, link.inviteCode);
+      if (result.success) {
+        updateLinkStatus(link.inviteCode, 'joined');
+        totalApproved++;
+      } else if (!result.needsApproval) {
+        updateLinkStatus(link.inviteCode, 'failed', result.error);
         totalRejected++;
       }
-      await new Promise(r => setTimeout(r, 3000));
+    } catch (error) {
+      updateLinkStatus(link.inviteCode, 'failed', (error as Error).message);
+      totalRejected++;
     }
+    await new Promise(r => setTimeout(r, 3000));
   }
 
   const newStats = getPoolStats();
@@ -1452,110 +1353,74 @@ bot.action('pool_confirm_clear_all', async (ctx) => {
   });
 });
 
-// Обработчики для разного количества
+// Обработчики для рандомного присоединения из глобального пула
 for (const count of [10, 20, 30, 50]) {
   bot.action(`pool_join_${count}`, async (ctx) => {
     await safeAnswerCb(ctx);
-    const accStats = getAccountPoolStats();
-    if (accStats.length === 0) {
-      await safeReply(ctx, '❌ Нет подключенных аккаунтов');
-      return;
-    }
 
     const stats = getPoolStats();
     if (stats.ready === 0) {
-      await safeReply(ctx, '📭 Нет готовых ссылок');
+      await safeReply(ctx, '📭 Нет готовых ссылок в пуле');
       return;
     }
 
-    const actualCount = Math.min(count, stats.ready);
+    // Получаем рандомные ссылки из глобального пула
+    const shuffledLinks = getReadyLinks(count);
 
     await safeReply(ctx,
-      `🚀 *Присоединение ${actualCount} ссылок*\n\n` +
-      `📱 Аккаунтов: ${accStats.length}\n` +
-      `📊 Распределение: ~${Math.ceil(actualCount / accStats.length)} ссылок на аккаунт\n\n` +
-      `⏳ Начинаем процесс...`,
+      `🚀 *Рандомное присоединение*\n\n` +
+      `📊 Выбрано: ${shuffledLinks.length} ссылок\n` +
+      `🟢 В пуле осталось: ${stats.ready - shuffledLinks.length}\n\n` +
+      `⏳ Обрабатываем...`,
       { parse_mode: 'Markdown' }
     );
 
-    let totalJoined = 0, totalPending = 0, totalFailed = 0, totalAlready = 0, totalSessionErrors = 0;
-    let hasSessionError = false;
+    let totalJoined = 0, totalPending = 0, totalFailed = 0, totalAlready = 0;
 
-    for (const acc of accStats) {
-      const accData = waAccounts.get(acc.accountId);
-      if (!accData || accData.status !== 'connected') {
-        await safeReply(ctx, `⚠️ Аккаунт ${acc.phone} не подключен, пропускаем...`);
-        continue;
+    for (let i = 0; i < shuffledLinks.length; i++) {
+      const link = shuffledLinks[i];
+
+      // Для каждой ссылки выбираем случайный подключенный аккаунт
+      const connectedAccounts = [...waAccounts.entries()].filter(([_, a]) => a.status === 'connected');
+      if (connectedAccounts.length === 0) {
+        await safeReply(ctx, '❌ Нет подключенных аккаунтов');
+        break;
       }
 
-      const linksForAcc = Math.ceil(actualCount / accStats.length);
-      // Получаем рандомные ссылки для этого аккаунта
-      const allReadyLinks = getReadyLinks(acc.accountId, 1000); // Получаем все
-      const shuffledLinks = shuffleArray(allReadyLinks).slice(0, linksForAcc);
+      const randomIndex = Math.floor(Math.random() * connectedAccounts.length);
+      const [accountId, accData] = connectedAccounts[randomIndex];
 
-      await safeReply(ctx,
-        `📱 *${acc.phone}*\n` +
-        `🎯 Рандомных для обработки: ${shuffledLinks.length}\n` +
-        `⏳ Обрабатываем...`,
-        { parse_mode: 'Markdown' }
-      );
+      try {
+        const result = await joinGroupByInvite(accData.client, link.inviteCode);
 
-      for (let i = 0; i < shuffledLinks.length; i++) {
-        const link = shuffledLinks[i];
-
-        if (getPendingCount(acc.accountId) >= MAX_PENDING_JOIN_REQUESTS) {
-          await safeReply(ctx, `⚠️ Достигнут лимит pending заявок для ${acc.phone}`);
-          break;
-        }
-
-        try {
-          const result = await joinGroupByInvite(accData.client, link.inviteCode);
-
-          if (result.sessionInvalid) {
-            // Сессия устарела
-            hasSessionError = true;
-            totalSessionErrors++;
-            accData.status = 'disconnected';
-            updateLinkStatus(acc.accountId, link.inviteCode, 'failed', 'Сессия устарела');
-            await safeReply(ctx,
-              `⚠️ *${acc.phone}*: Сессия устарела!\n` +
-              `⏹ Остановка для этого аккаунта.\n` +
-              `💡 Перейдите в "📱 Аккаунты" → "🔄 Проверить статус" или переподключите номер.`,
-              { parse_mode: 'Markdown' }
-            );
-            break;
-          }
-
-          if (result.success) {
-            if (result.alreadyJoined) {
-              totalAlready++;
-            } else {
-              totalJoined++;
-            }
-            updateLinkStatus(acc.accountId, link.inviteCode, 'joined');
-          } else if (result.needsApproval) {
-            totalPending++;
-            updateLinkStatus(acc.accountId, link.inviteCode, 'pending');
+        if (result.success) {
+          if (result.alreadyJoined) {
+            totalAlready++;
           } else {
-            totalFailed++;
-            updateLinkStatus(acc.accountId, link.inviteCode, 'failed', result.error);
+            totalJoined++;
           }
-
-          // Обновляем прогресс каждые 5 ссылок
-          if ((i + 1) % 5 === 0 || i === shuffledLinks.length - 1) {
-            await safeReply(ctx,
-              `📊 *${acc.phone}*\n` +
-              `🔗 ${i + 1}/${shuffledLinks.length}\n` +
-              `✅ +${totalJoined} | ❌ +${totalFailed} | 🔔 +${totalPending}`
-            );
-          }
-        } catch (error) {
+          updateLinkStatus(link.inviteCode, 'joined');
+        } else if (result.needsApproval) {
+          totalPending++;
+          updateLinkStatus(link.inviteCode, 'pending');
+        } else {
           totalFailed++;
-          updateLinkStatus(acc.accountId, link.inviteCode, 'failed', (error as Error).message);
+          updateLinkStatus(link.inviteCode, 'failed', result.error);
         }
 
-        await new Promise(r => setTimeout(r, JOIN_DELAY_MIN));
+        // Обновляем прогресс каждые 5 ссылок
+        if ((i + 1) % 5 === 0 || i === shuffledLinks.length - 1) {
+          await safeReply(ctx,
+            `📊 Прогресс: ${i + 1}/${shuffledLinks.length}\n` +
+            `✅ ${totalJoined} | ❌ ${totalFailed} | 🔔 ${totalPending}`
+          );
+        }
+      } catch (error) {
+        totalFailed++;
+        updateLinkStatus(link.inviteCode, 'failed', (error as Error).message);
       }
+
+      await new Promise(r => setTimeout(r, JOIN_DELAY_MIN));
     }
 
     const newStats = getPoolStats();
@@ -1564,13 +1429,7 @@ for (const count of [10, 20, 30, 50]) {
     finalText += `🔔 Pending: ${totalPending}\n`;
     finalText += `❌ Ошибок: ${totalFailed}\n`;
     finalText += `⏭️ Уже в группе: ${totalAlready}\n`;
-    if (totalSessionErrors > 0) {
-      finalText += `⚠️ Сессий устарело: ${totalSessionErrors}\n`;
-    }
-    finalText += `\n📊 Осталось: 🟢 ${newStats.ready} | 🔔 ${newStats.pending}`;
-    if (hasSessionError) {
-      finalText += `\n\n💡 Для продолжения:\n1. Перейдите в "📱 Аккаунты"\n2. Проверьте/переподключите аккаунты с устаревшими сессиями`;
-    }
+    finalText += `\n📊 Осталось в пуле: 🟢 ${newStats.ready}`;
 
     await safeReply(ctx, finalText, { parse_mode: 'Markdown' });
   });
@@ -3184,11 +3043,11 @@ function startAutoRejoinForAllAccounts() {
       const pendingItems = queue.filter(p => p.status === 'pending');
 
       // Если нет pending заявок, пробуем добавить новые из пула
-      if (pendingItems.length === 0 && getReadyLinks(accountId, 1).length > 0) {
+      if (pendingItems.length === 0 && getReadyLinks( 1).length > 0) {
         console.log(`  🔄 Auto-rejoin for ${acc.phone || accountId}: Adding new links from pool`);
 
         // Получаем рандомные ссылки из пула
-        const readyLinks = getReadyLinks(accountId, 10); // Берём до 10 ссылок
+        const readyLinks = getReadyLinks( 10); // Берём до 10 ссылок
         if (readyLinks.length > 0) {
           const shuffledLinks = shuffleArray(readyLinks);
           const linksToJoin = shuffledLinks.slice(0, MAX_PENDING_JOIN_REQUESTS);
@@ -3231,7 +3090,7 @@ function startAutoRejoinForAllAccounts() {
               console.log(`    ❌ Rejected/expired: ${item.inviteCode}`);
 
               // Автоматически пробуем следующую ссылку из пула
-              const moreLinks = getReadyLinks(accountId, 1);
+              const moreLinks = getReadyLinks( 1);
               if (moreLinks.length > 0) {
                 const shuffled = shuffleArray(moreLinks);
                 const link = shuffled[0];
@@ -3272,7 +3131,7 @@ async function autoJoinNextPending(accountId: string, links: { inviteCode: strin
     const link = links[i];
 
     // Проверяем лимит pending
-    if (getPendingCount(accountId) >= MAX_PENDING_JOIN_REQUESTS) {
+    if (getPendingCount() >= MAX_PENDING_JOIN_REQUESTS) {
       break;
     }
 
@@ -3281,14 +3140,14 @@ async function autoJoinNextPending(accountId: string, links: { inviteCode: strin
 
       if (result.needsApproval) {
         addToPendingQueue(accountId, link.inviteCode, link.fullLink);
-        updateLinkStatus(accountId, link.inviteCode, 'pending');
+        updateLinkStatus( link.inviteCode, 'pending');
       } else if (result.success) {
-        updateLinkStatus(accountId, link.inviteCode, 'joined');
+        updateLinkStatus( link.inviteCode, 'joined');
       } else {
-        updateLinkStatus(accountId, link.inviteCode, 'failed', result.error || 'Unknown error');
+        updateLinkStatus( link.inviteCode, 'failed', result.error || 'Unknown error');
       }
     } catch (e) {
-      updateLinkStatus(accountId, link.inviteCode, 'failed', (e as Error).message);
+      updateLinkStatus( link.inviteCode, 'failed', (e as Error).message);
     }
 
     // Задержка между попытками
