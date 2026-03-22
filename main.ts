@@ -3168,6 +3168,134 @@ function startSessionKeepalive() {
   }, 15 * 60 * 1000); // 15 минут
 }
 
+// Автоматический повторный вход для pending заявок
+function startAutoRejoinForAllAccounts() {
+  // Каждые 5 минут проверяем pending заявки
+  setInterval(async () => {
+    console.log('🔄 Checking pending requests for auto-rejoin...');
+
+    for (const [accountId, acc] of waAccounts) {
+      // Пропускаем если авто-повтор выключен или аккаунт не подключен
+      if (!acc.autoJoinPending || acc.status !== 'connected') {
+        continue;
+      }
+
+      const queue = pendingJoinRequests.get(accountId) || [];
+      const pendingItems = queue.filter(p => p.status === 'pending');
+
+      // Если нет pending заявок, пробуем добавить новые из пула
+      if (pendingItems.length === 0 && getReadyLinks(accountId, 1).length > 0) {
+        console.log(`  🔄 Auto-rejoin for ${acc.phone || accountId}: Adding new links from pool`);
+
+        // Получаем рандомные ссылки из пула
+        const readyLinks = getReadyLinks(accountId, 10); // Берём до 10 ссылок
+        if (readyLinks.length > 0) {
+          const shuffledLinks = shuffleArray(readyLinks);
+          const linksToJoin = shuffledLinks.slice(0, MAX_PENDING_JOIN_REQUESTS);
+
+          // Добавляем в pending очередь
+          for (const link of linksToJoin) {
+            const inviteCode = extractInviteCode(link.fullLink);
+            if (inviteCode) {
+              addToPendingQueue(accountId, inviteCode, link.fullLink);
+              console.log(`    📋 Added: ${inviteCode}`);
+            }
+          }
+
+          // Запускаем процесс присоединения
+          try {
+            await autoJoinNextPending(accountId, linksToJoin.map(l => ({
+              inviteCode: extractInviteCode(l.fullLink)!,
+              fullLink: l.fullLink
+            })));
+          } catch (e) {
+            console.log(`  ❌ Auto-rejoin error for ${accountId}: ${(e as Error).message}`);
+          }
+        }
+      } else if (pendingItems.length > 0) {
+        // Есть pending заявки - проверяем их статус
+        console.log(`  🔍 Checking ${pendingItems.length} pending requests for ${acc.phone || accountId}`);
+
+        // Проверяем каждый pending запрос
+        for (const item of pendingItems) {
+          try {
+            const result = await joinGroupByInvite(acc.client, item.inviteCode);
+
+            if (result.success) {
+              // Заявка одобрена!
+              item.status = 'approved';
+              console.log(`    ✅ Approved: ${item.inviteCode}`);
+            } else if (!result.needsApproval) {
+              // Заявка отклонена или истекла
+              item.status = 'rejected';
+              console.log(`    ❌ Rejected/expired: ${item.inviteCode}`);
+
+              // Автоматически пробуем следующую ссылку из пула
+              const moreLinks = getReadyLinks(accountId, 1);
+              if (moreLinks.length > 0) {
+                const shuffled = shuffleArray(moreLinks);
+                const link = shuffled[0];
+                const inviteCode = extractInviteCode(link.fullLink);
+                if (inviteCode) {
+                  addToPendingQueue(accountId, inviteCode, link.fullLink);
+                  console.log(`    📋 Auto-added replacement: ${inviteCode}`);
+
+                  // Сразу пробуем присоединиться
+                  await joinGroupByInvite(acc.client, inviteCode);
+                }
+              }
+            }
+          } catch (e) {
+            console.log(`    ⚠️ Error checking ${item.inviteCode}: ${(e as Error).message}`);
+          }
+
+          // Небольшая задержка между проверками
+          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        // Удаляем обработанные заявки из очереди
+        const updatedQueue = queue.filter(p => p.status === 'pending');
+        pendingJoinRequests.set(accountId, updatedQueue);
+      }
+    }
+  }, 5 * 60 * 1000); // 5 минут
+}
+
+// Автоматическое присоединение к следующему pending чату
+async function autoJoinNextPending(accountId: string, links: { inviteCode: string; fullLink: string }[]) {
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') return;
+
+  const maxToJoin = Math.min(links.length, MAX_PENDING_JOIN_REQUESTS);
+
+  for (let i = 0; i < maxToJoin; i++) {
+    const link = links[i];
+
+    // Проверяем лимит pending
+    if (getPendingCount(accountId) >= MAX_PENDING_JOIN_REQUESTS) {
+      break;
+    }
+
+    try {
+      const result = await joinGroupByInvite(acc.client, link.inviteCode);
+
+      if (result.needsApproval) {
+        addToPendingQueue(accountId, link.inviteCode, link.fullLink);
+        updateLinkStatus(accountId, link.inviteCode, 'pending');
+      } else if (result.success) {
+        updateLinkStatus(accountId, link.inviteCode, 'joined');
+      } else {
+        updateLinkStatus(accountId, link.inviteCode, 'failed', result.error || 'Unknown error');
+      }
+    } catch (e) {
+      updateLinkStatus(accountId, link.inviteCode, 'failed', (e as Error).message);
+    }
+
+    // Задержка между попытками
+    await new Promise(r => setTimeout(r, JOIN_DELAY_MIN));
+  }
+}
+
 async function main() {
   console.log('🚀 Starting bot...');
   console.log('Admin IDs:', ADMIN_IDS);
@@ -3186,6 +3314,9 @@ async function main() {
 
   // Запускаем периодическую проверку сессий для поддержания их живыми
   startSessionKeepalive();
+
+  // Запускаем авто-повтор pending заявок
+  startAutoRejoinForAllAccounts();
 
   await bot.launch();
   console.log('✅ Bot started');
