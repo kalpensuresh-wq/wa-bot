@@ -141,6 +141,22 @@ async function restoreExistingAccounts(): Promise<void> {
         acc.status = 'disconnected';
         console.log(`⚠️ Account disconnected: ${accountId}`);
         saveAccountsData();
+
+        // ONE-TIME уведомление об отключении (не спамим)
+        const now = Date.now();
+        const lastNotified = lastDisconnectNotification.get(accountId) || 0;
+        if (now - lastNotified > DISCONNECT_NOTIFICATION_COOLDOWN) {
+          lastDisconnectNotification.set(accountId, now);
+          // Уведомляем админов
+          const msg = `⚠️ *Отключение аккаунта*\n\n📱 Аккаунт: ${acc.name || acc.phone || accountId}\n\n🔄 Бот автоматически восстановит сессию`;
+          for (const adminId of ADMIN_IDS) {
+            try {
+              await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'Markdown' });
+            } catch (e) {
+              // Игнорируем ошибки отправки
+            }
+          }
+        }
       }
     });
 
@@ -280,6 +296,17 @@ const activeJoins = new Map<string, {
   accountId: string;
 }>();
 
+// === АКТИВНЫЕ ПРОЦЕССЫ ПУЛА ===
+const activePoolJoins = new Map<string, {
+  stop: boolean;
+  joined: number;
+  pending: number;
+  failed: number;
+  already: number;
+  total: number;
+  accountId: string;
+}>();
+
 // === СИСТЕМА PENDING ЗАЯВОК ===
 interface PendingRequest {
   inviteCode: string;
@@ -299,6 +326,101 @@ const activePendingProcessor = new Map<string, {
   approved: number;
   rejected: number;
 }>();
+
+// === СИСТЕМА УВЕДОМЛЕНИЙ ОБ ОТКЛЮЧЕНИИ ===
+// Храним время последнего уведомления об отключении (one-time notification)
+const lastDisconnectNotification = new Map<string, number>();
+const DISCONNECT_NOTIFICATION_COOLDOWN = 60 * 60 * 1000; // 1 час между уведомлениями
+
+// === ФУНКЦИЯ ПРЕДВАРИТЕЛЬНОЙ ПРОВЕРКИ ГРУППЫ (ВАРИАНТ A) ===
+// Определяет тип ссылки ДО попытки присоединения
+async function previewGroupInvite(client: Client, inviteCode: string): Promise<{
+  type: 'working' | 'pending' | 'failed' | 'already' | 'unknown';
+  groupName?: string;
+  error?: string;
+}> {
+  try {
+    // Проверяем что сессия валидна
+    if (!client.info?.wid) {
+      return { type: 'failed', error: 'Сессия неактивна' };
+    }
+
+    // Сначала проверяем, не состоим ли уже в группе
+    const allChats = await client.getChats();
+    const existingChat = allChats.find((chat: any) =>
+      chat.isGroup && chat.link && chat.link.includes(inviteCode)
+    );
+    if (existingChat) {
+      return { type: 'already', groupName: existingChat.name };
+    }
+
+    // Пытаемся получить информацию о группе через Web API
+    // Используем queryExistingGroup для проверки
+    try {
+      // Пробуем создать приглашение - это позволяет проверить тип группы
+      const groupInfo = await (client as any).inviteCodeInfo?.(inviteCode) ||
+                        await (client as any).getGroupInviteLinkInfo?.(inviteCode);
+
+      if (groupInfo) {
+        // Группа существует и доступна для просмотра
+        // Проверяем, требуется ли одобрение
+        if (groupInfo.announce || groupInfo.restrict || groupInfo.joinApprovalMode) {
+          return { type: 'pending', groupName: groupInfo.subject || 'Неизвестная группа' };
+        }
+        return { type: 'working', groupName: groupInfo.subject || 'Неизвестная группа' };
+      }
+    } catch (infoError) {
+      // Игнорируем ошибки получения инфо
+    }
+
+    // Прямая попытка присоединения для определения типа
+    try {
+      await client.acceptInvite(inviteCode);
+      return { type: 'working' };
+    } catch (joinError: any) {
+      const errMsg = (joinError.message || String(joinError)).toLowerCase();
+
+      // Проверяем на "требуется одобрение"
+      if (errMsg.includes('approval') ||
+          errMsg.includes('join') ||
+          errMsg.includes('require') ||
+          errMsg.includes('admin') ||
+          errMsg.includes('401') ||
+          errMsg.includes('request')) {
+        return { type: 'pending', error: 'Требуется одобрение администратора' };
+      }
+
+      // Проверяем на "недействительна/истекла"
+      if (errMsg.includes('invalid') ||
+          errMsg.includes('expired') ||
+          errMsg.includes('not found') ||
+          errMsg.includes('404') ||
+          errMsg.includes('сброшено')) {
+        return { type: 'failed', error: 'Ссылка недействительна или истекла' };
+      }
+
+      // Проверяем на "уже состоишь"
+      if (errMsg.includes('already') || errMsg.includes('member')) {
+        return { type: 'already' };
+      }
+
+      return { type: 'unknown', error: joinError.message || 'Неизвестная ошибка' };
+    }
+  } catch (error: any) {
+    const errMsg = (error.message || String(error)).toLowerCase();
+
+    // Анализируем ошибку
+    if (errMsg.includes('invalid') || errMsg.includes('expired') || errMsg.includes('not found') || errMsg.includes('404') || errMsg.includes('сброшено')) {
+      return { type: 'failed', error: 'Ссылка недействительна или истекла' };
+    }
+
+    if (errMsg.includes('approval') || errMsg.includes('join') || errMsg.includes('require') || errMsg.includes('admin') || errMsg.includes('401')) {
+      return { type: 'pending', error: 'Требуется одобрение' };
+    }
+
+    return { type: 'unknown', error: error.message || 'Ошибка проверки' };
+  }
+}
 
 // === СИСТЕМА ПЕРСИСТЕНТНОГО ПУЛА (ЕДИНЫЙ ПУЛ ДЛЯ ВСЕХ АККАУНТОВ) ===
 const POOL_FILE_PATH = process.env.POOL_FILE_PATH || './data/pool.json';
@@ -702,72 +824,75 @@ function extractInviteCode(link: string): string | null {
   return null;
 }
 
-async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ success: boolean; error?: string; needsApproval?: boolean; alreadyJoined?: boolean; skipped?: boolean; sessionInvalid?: boolean }> {
+async function joinGroupByInvite(client: Client, inviteCode: string): Promise<{ success: boolean; error?: string; needsApproval?: boolean; alreadyJoined?: boolean; skipped?: boolean; sessionInvalid?: boolean; linkType?: 'working' | 'pending' | 'failed' | 'unknown' }> {
   try {
     // Проверяем что сессия валидна
     if (!client.info?.wid) {
       console.log(`  ⚠️ Session invalid - client not ready`);
       return { success: false, error: 'Сессия неактивна', sessionInvalid: true };
     }
-
     console.log(`  Checking/joining group with invite code: ${inviteCode}`);
-    const allChats = await client.getChats();
-    const existingChat = allChats.find((chat: any) =>
-      chat.isGroup && chat.link && chat.link.includes(inviteCode)
-    );
-    if (existingChat) {
-      console.log(`  ⚠️ Already a member of this group: ${existingChat.name || inviteCode}`);
-      return { success: true, alreadyJoined: true };
+
+    // === ВАРИАНТ A: Предварительная проверка типа ссылки ===
+    const preview = await previewGroupInvite(client, inviteCode);
+    console.log(`  📋 Preview: ${preview.type}${preview.groupName ? ` (${preview.groupName})` : ''}`);
+
+    // Возвращаем тип ссылки
+    if (preview.type === 'already') {
+      return { success: true, alreadyJoined: true, linkType: 'working' };
     }
-    // Проверяем требование одобрения ДО попытки присоединения
-    // Если сразу видим что нужно одобрение - пропускаем
+
+    if (preview.type === 'failed') {
+      return { success: false, error: preview.error || 'Ссылка недействительна', linkType: 'failed' };
+    }
+
+    if (preview.type === 'pending') {
+      return { success: false, error: preview.error || 'Требуется одобрение', needsApproval: true, linkType: 'pending' };
+    }
+
+    // Если working или unknown - пробуем присоединиться
     try {
       await client.acceptInvite(inviteCode);
       console.log(`  ✓ Successfully joined group`);
-      return { success: true };
+      return { success: true, linkType: 'working' };
     } catch (joinError: any) {
       const joinErrorMsg = joinError.message || String(joinError);
 
-      // Detached Frame - сессия стала невалидной
       if (joinErrorMsg.includes('detached Frame') || joinErrorMsg.includes('Evaluation failed')) {
-        console.log(`  ⚠️ Session became invalid (detached Frame) - needs re-auth`);
-        return { success: false, error: 'Сессия устарела, требуется переподключение', sessionInvalid: true };
+        return { success: false, error: 'Сессия устарела', sessionInvalid: true, linkType: 'failed' };
       }
-
-      // Если требуется одобрение - добавляем в pending очередь
       if (joinErrorMsg.includes('approval') || joinErrorMsg.includes('join') || joinErrorMsg.includes('require') || joinErrorMsg.includes('Admin') || joinErrorMsg.includes('401')) {
-        console.log(`  ⚠️ Group requires approval - adding to pending queue`);
-        return { success: false, error: 'Требуется одобрение', needsApproval: true };
+        return { success: false, error: 'Требуется одобрение', needsApproval: true, linkType: 'pending' };
       }
-
-      // Для других ошибок - пробросим их выше
+      if (joinErrorMsg.includes('invalid') || joinErrorMsg.includes('expired') || joinErrorMsg.includes('not found')) {
+        return { success: false, error: 'Ссылка недействительна', linkType: 'failed' };
+      }
+      if (joinErrorMsg.includes('already') || joinErrorMsg.includes('member')) {
+        return { success: true, alreadyJoined: true, linkType: 'working' };
+      }
       throw joinError;
     }
   } catch (error: any) {
     const errorMessage = error.message || String(error);
     console.error(`  ✗ Join failed:`, errorMessage);
-
-    // Detached Frame
     if (errorMessage.includes('detached Frame') || errorMessage.includes('Evaluation failed')) {
-      return { success: false, error: 'Сессия устарела, требуется переподключение', sessionInvalid: true };
+      return { success: false, error: 'Сессия устарела', sessionInvalid: true, linkType: 'failed' };
     }
     if (errorMessage.includes('invalid') || errorMessage.includes('expired')) {
-      return { success: false, error: 'Ссылка недействительна или истекла' };
+      return { success: false, error: 'Ссылка недействительна', linkType: 'failed' };
     }
     if (errorMessage.includes('approval') || errorMessage.includes('join') || errorMessage.includes('require') || errorMessage.includes('Admin') || errorMessage.includes('401')) {
-      console.log(`  ⚠️ Group requires approval - adding to pending queue`);
-      return { success: false, error: 'Требуется одобрение администратора', needsApproval: true };
+      return { success: false, error: 'Требуется одобрение', needsApproval: true, linkType: 'pending' };
     }
     if (errorMessage.includes('not found') || errorMessage.includes('404')) {
-      return { success: false, error: 'Группа не найдена' };
+      return { success: false, error: 'Группа не найдена', linkType: 'failed' };
     }
     if (errorMessage.includes('already') || errorMessage.includes('member')) {
-      return { success: true, alreadyJoined: true };
+      return { success: true, alreadyJoined: true, linkType: 'working' };
     }
-    return { success: false, error: errorMessage };
+    return { success: false, error: errorMessage, linkType: 'unknown' };
   }
 }
-
 // === ФУНКЦИИ ПАРСИНГА ФАЙЛОВ ===
 
 // Скачать файл по URL или получить локальный путь
@@ -1936,8 +2061,34 @@ bot.action(/^stop_join_(.+)$/, async (ctx) => {
     }
   }
 
+  // Останавливаем активные процессы пула
+  for (const [poolJoinId, poolData] of activePoolJoins.entries()) {
+    if (poolData.accountId === accountId) {
+      poolData.stop = true;
+    }
+  }
+
   await safeReply(ctx, `⏹ Присоединение для ${acc.name || acc.phone} остановлено!`);
   await safeEdit(ctx, `✅ Присоединение остановлено!\n📱 Аккаунт: ${acc.name || acc.phone}`, { ...pendingAccMenu(accountId) });
+});
+
+// === STOP BROADCAST ===
+bot.action(/^stop_broadcast_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const broadcastId = ctx.match?.[1];
+  if (!broadcastId) return;
+
+  const broadcast = activeBroadcasts.get(broadcastId);
+  if (!broadcast) {
+    await safeEdit(ctx, '❌ Рассылка не найдена или уже завершена', {});
+    return;
+  }
+
+  broadcast.stop = true;
+
+  const acc = waAccounts.get(broadcast.accountId);
+  await safeReply(ctx, `⏹ Команда остановки отправлена для рассылки!`);
+  await safeEdit(ctx, `⏹ *Рассылка останавливается...*\n\n📱 Аккаунт: ${acc?.name || acc?.phone || 'неизвестен'}\n\n⏳ Дождитесь завершения текущего сообщения...`, { parse_mode: 'Markdown' });
 });
 
 // === SETTINGS ===
@@ -2135,7 +2286,7 @@ bot.on('text', async (ctx) => {
         await safeReply(ctx, '❌ Введите число от 1 до 60 минут');
         return;
       }
-      acc.joinDelay = delayMinutes;
+      acc!.joinDelay = delayMinutes;
       saveAccountsData();
 
       const chatCount = (state as any).chatCount || 10;
@@ -2149,19 +2300,55 @@ bot.on('text', async (ctx) => {
         return;
       }
 
+      // Создаем активный процесс пула
+      const poolJoinId = Date.now().toString();
+      activePoolJoins.set(poolJoinId, {
+        stop: false,
+        joined: 0,
+        pending: 0,
+        failed: 0,
+        already: 0,
+        total: shuffledLinks.length,
+        accountId: accountId!
+      });
+      acc!.isJoining = true;
+
       await safeReply(ctx,
         `🚀 *Присоединение к чатам*\n\n` +
         `📱 Аккаунт: ${acc!.name || acc!.phone}\n` +
         `📊 Количество чатов: ${shuffledLinks.length}\n` +
         `⏱ Задержка: ${delayMinutes} мин (±1 мин)\n\n` +
         `⏳ Начинаем присоединение...`,
-        { parse_mode: 'Markdown' }
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('⏹ СТОП ПРИСОЕДИНЕНИЕ', `stop_join_${accountId}`)]
+            ]
+          }
+        }
       );
 
       // Запускаем процесс присоединения
       let totalJoined = 0, totalPending = 0, totalFailed = 0, totalAlready = 0;
 
       for (let i = 0; i < shuffledLinks.length; i++) {
+        const poolJoin = activePoolJoins.get(poolJoinId);
+
+        // Проверяем флаг остановки
+        if (poolJoin?.stop) {
+          acc!.isJoining = false;
+          activePoolJoins.delete(poolJoinId);
+          await safeReply(ctx,
+            `⏹ *Присоединение остановлено!*\n\n` +
+            `✅ Присоединено: ${totalJoined}\n` +
+            `🔔 Pending: ${totalPending}\n` +
+            `❌ Ошибок: ${totalFailed}\n` +
+            `⏭️ Уже в группе: ${totalAlready}`
+          );
+          return;
+        }
+
         const link = shuffledLinks[i];
 
         try {
@@ -2182,11 +2369,27 @@ bot.on('text', async (ctx) => {
             updateLinkStatus(link.inviteCode, 'failed', result.error);
           }
 
+          // Обновляем статистику в activePoolJoins
+          if (poolJoin) {
+            poolJoin.joined = totalJoined;
+            poolJoin.pending = totalPending;
+            poolJoin.failed = totalFailed;
+            poolJoin.already = totalAlready;
+          }
+
           // Обновляем прогресс каждые 3 ссылки
           if ((i + 1) % 3 === 0 || i === shuffledLinks.length - 1) {
             await safeReply(ctx,
               `📊 Прогресс: ${i + 1}/${shuffledLinks.length}\n` +
-              `✅ ${totalJoined} | ❌ ${totalFailed} | 🔔 ${totalPending}`
+              `✅ ${totalJoined} | ❌ ${totalFailed} | 🔔 ${totalPending}\n\n` +
+              `⏳ Продолжаем...`,
+              {
+                reply_markup: {
+                  inline_keyboard: [
+                    [Markup.button.callback('⏹ СТОП', `stop_join_${accountId}`)]
+                  ]
+                }
+              }
             );
           }
         } catch (error) {
@@ -2198,6 +2401,10 @@ bot.on('text', async (ctx) => {
         const randomDelay = (delayMinutes * 60000) + (Math.random() * 60000 - 30000);
         await new Promise(r => setTimeout(r, Math.max(30000, randomDelay)));
       }
+
+      // Очищаем состояние
+      acc!.isJoining = false;
+      activePoolJoins.delete(poolJoinId);
 
       const newStats = getPoolStats();
       await safeReply(ctx,
@@ -2472,7 +2679,23 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
   client.on('disconnected', async () => {
     console.log(`⚠️ Account disconnected: ${phone}`);
     const acc = waAccounts.get(accountId);
-    if (acc) acc.status = 'disconnected';
+    if (acc) {
+      acc.status = 'disconnected';
+      // ONE-TIME уведомление об отключении (не спамим)
+      const now = Date.now();
+      const lastNotified = lastDisconnectNotification.get(accountId) || 0;
+      if (now - lastNotified > DISCONNECT_NOTIFICATION_COOLDOWN) {
+        lastDisconnectNotification.set(accountId, now);
+        const msg = `⚠️ *Отключение аккаунта*\n\n📱 Аккаунт: ${acc.name || acc.phone || phone}\n\n🔄 Бот автоматически восстановит сессию`;
+        for (const adminId of ADMIN_IDS) {
+          try {
+            await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'Markdown' });
+          } catch (e) {
+            // Игнорируем ошибки отправки
+          }
+        }
+      }
+    }
     if (ctx) {
       await safeReply(ctx, `⚠️ Аккаунт отключился`);
     }
@@ -2626,9 +2849,15 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       `📊 Найдено: ${archivedChats.length} чатов\n   👥 Групп: ${groups.length}\n   👤 Диалогов: ${individuals.length}\n\n` +
       `🛡️ *Защита:*\n   ⏱ Задержка: ${acc.broadcastDelay} мин (±1 мин)\n   📊 Лимит: БЕЗ ОГРАНИЧЕНИЙ\n\n` +
       `⏱ Примерное время: ~${hours}ч ${mins}мин\n\n` +
-      `⏳ Рассылка по кругу пока не остановите...\n` +
-      `🛑 Для остановки нажмите "⏹ Стоп"`,
-      { parse_mode: 'Markdown' }
+      `⏳ Рассылка по кругу пока не остановите...`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [Markup.button.callback('⏹ СТОП РАССЫЛКУ', `stop_broadcast_${broadcastId}`)]
+          ]
+        }
+      }
     );
 
     let sent = 0;
@@ -3075,6 +3304,18 @@ function startSessionKeepalive() {
               newClient.on('disconnected', async () => {
                 acc.status = 'disconnected';
                 console.log(`  ⚠️ Session ${id} disconnected again`);
+                // ONE-TIME уведомление
+                const now = Date.now();
+                const lastNotified = lastDisconnectNotification.get(id) || 0;
+                if (now - lastNotified > DISCONNECT_NOTIFICATION_COOLDOWN) {
+                  lastDisconnectNotification.set(id, now);
+                  const msg = `⚠️ *Отключение аккаунта*\n\n📱 Аккаунт: ${acc.name || acc.phone || id}\n\n🔄 Бот автоматически восстановит сессию`;
+                  for (const adminId of ADMIN_IDS) {
+                    try {
+                      await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'Markdown' });
+                    } catch (e) {}
+                  }
+                }
               });
 
               await newClient.initialize();
