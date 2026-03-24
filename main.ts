@@ -27,6 +27,8 @@ interface AccountData {
   broadcastDelay: number;
   joinDelay: number;
   autoJoinPending: boolean;
+  messagesBeforePause: number;  // Лимит сообщений перед паузой
+  pauseDurationMinutes: number;  // Длительность паузы в минутах
 }
 
 // Сохранить данные аккаунтов
@@ -43,7 +45,9 @@ function saveAccountsData(): void {
         failedToday: acc.failedToday,
         broadcastDelay: acc.broadcastDelay || 10,
         joinDelay: acc.joinDelay || 10,
-        autoJoinPending: acc.autoJoinPending
+        autoJoinPending: acc.autoJoinPending,
+        messagesBeforePause: (acc as any).messagesBeforePause || 100,
+        pauseDurationMinutes: (acc as any).pauseDurationMinutes || 10
       };
     });
     const dir = ACCOUNTS_FILE_PATH.substring(0, ACCOUNTS_FILE_PATH.lastIndexOf('/'));
@@ -123,8 +127,10 @@ async function restoreExistingAccounts(): Promise<void> {
       joinDelay: accData.joinDelay || 10,
       isBroadcasting: false,
       isJoining: false,
-      autoJoinPending: accData.autoJoinPending || false
-    });
+      autoJoinPending: accData.autoJoinPending || false,
+      messagesBeforePause: accData.messagesBeforePause || 100,
+      pauseDurationMinutes: accData.pauseDurationMinutes || 10
+    } as any);
 
     client.on('ready', async () => {
       const acc = waAccounts.get(accountId);
@@ -267,8 +273,14 @@ const activeBroadcasts = new Map<string, {
   stop: boolean;
   sent: number;
   failed: number;
+  consecutiveErrors: number;
   total: number;
   accountId: string;
+  messagesBeforePause: number;
+  pauseDurationMinutes: number;
+  isPaused: boolean;
+  pauseEndTime?: number;
+  messagesSincePause: number;
 }>();
 const pendingGroupLinks = new Map<string, string[]>();
 
@@ -279,6 +291,11 @@ const FIXED_DELAY = 10 * 60 * 1000;  // ФИКСИРОВАННЫЕ 10 минут
 const MAX_MESSAGES_PER_DAY = 999999; // ЛИМИТ ОТКЛЮЧЁН
 const NIGHT_PAUSE_START = 24;       // Отключена
 const NIGHT_PAUSE_END = 24;
+
+// === ЗАЩИТА ОТ БАНА ===
+const MAX_CONSECUTIVE_ERRORS = 3;      // После 3 ошибок - пауза 1 час
+const ERROR_PAUSE_DURATION = 60;       // 60 минут пауза при ошибках
+const MAX_ERROR_PAUSE_CYCLES = 2;      // После 2 таких пауз - полная остановка
 
 // Конфигурация авто-присоединения
 const JOIN_DELAY_MIN = 10 * 60 * 1000;
@@ -1014,12 +1031,19 @@ const accountsMenu = (accountId?: string) => {
         // Настройки задержек
         buttons.push([Markup.button.callback(`⏱ Рассылка: ${acc.broadcastDelay} мин (±1)`, `set_broadcast_delay_${accountId}`)]);
         buttons.push([Markup.button.callback(`🔗 Присоединение: ${acc.joinDelay} мин (±1)`, `set_join_delay_${accountId}`)]);
+        // Настройки защиты от бана
+        const messagesBeforePause = (acc as any).messagesBeforePause || 100;
+        const pauseDurationMinutes = (acc as any).pauseDurationMinutes || 10;
+        buttons.push([Markup.button.callback(`🛡️ Пауза: ${messagesBeforePause} msg / ${pauseDurationMinutes} мин`, `set_pause_limit_${accountId}`)]);
         // Авто-повтор pending
         const autoText = acc.autoJoinPending ? '🔄 Авто-повтор: ВКЛ' : '🔄 Авто-повтор: ВЫКЛ';
         buttons.push([Markup.button.callback(autoText, `toggle_auto_pending_${accountId}`)]);
         buttons.push([Markup.button.callback('🔍 Просмотр чатов', `view_chats_${accountId}`)]);
+      } else {
+        // Для отключенных аккаунтов показываем кнопку переподключения
+        buttons.push([Markup.button.callback('📷 Переподключить (QR)', `reconnect_qr_${accountId}`)]);
+        buttons.push([Markup.button.callback('🔄 Проверить статус', `refresh_acc_${accountId}`)]);
       }
-      buttons.push([Markup.button.callback('🔄 Проверить статус', `refresh_acc_${accountId}`)]);
       buttons.push([Markup.button.callback('X Отвязать номер', `unbind_${accountId}`)]);
     }
     buttons.push([Markup.button.callback('< Back to list', 'accounts')]);
@@ -1028,6 +1052,7 @@ const accountsMenu = (accountId?: string) => {
       waAccounts.forEach((acc, id) => {
         const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'connecting' ? '🔄' : '🔴';
         const enabledEmoji = acc.enabled ? '✅' : '❌';
+        // Все аккаунты кликабельны, проверка статуса в обработчике
         buttons.push([Markup.button.callback(`${emoji} ${enabledEmoji} ${acc.name || acc.phone || id}`, `acc_${id}`)]);
       });
       buttons.push([Markup.button.callback('🔄 Проверить все статусы', 'refresh_all_accounts')]);
@@ -1824,6 +1849,73 @@ bot.action('refresh_all_accounts', async (ctx) => {
   );
 });
 
+// === НАСТРОЙКА ЛИМИТА СООБЩЕНИЙ И ПАУЗЫ ===
+bot.action(/^set_pause_limit_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.status !== 'connected') {
+    await safeEdit(ctx, '❌ Аккаунт не подключен', { ...accountsMenu(accountId) });
+    return;
+  }
+
+  // Запрашиваем лимит сообщений
+  userStates.set(ctx.from!.id, { action: 'waiting_pause_messages', accountId });
+  const currentMessages = (acc as any).messagesBeforePause || 100;
+  const currentPause = (acc as any).pauseDurationMinutes || 10;
+
+  await safeEdit(ctx,
+    `🛡️ *Настройка защиты от бана*\n\n` +
+    `📊 Текущие настройки:\n` +
+    `   📝 Лимит сообщений: ${currentMessages}\n` +
+    `   ⏱ Длительность паузы: ${currentPause} мин\n\n` +
+    `📝 *Введите лимит сообщений:*\n` +
+    `Рекомендуется: 50-200 сообщений\n` +
+    `Диапазон: 10-500`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('◀️ Назад', `acc_${accountId}`)]
+        ]
+      }
+    }
+  );
+});
+
+// Переподключение через QR для отключенных аккаунтов
+bot.action(/^reconnect_qr_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+  const acc = waAccounts.get(accountId);
+  if (!acc) {
+    await safeEdit(ctx, '❌ Аккаунт не найден', { ...accountsMenu() });
+    return;
+  }
+
+  await safeEdit(ctx,
+    `📷 *Переподключение аккаунта*\n\n` +
+    `📱 Аккаунт: ${acc.name || acc.phone || accountId}\n` +
+    `⚠️ Статус: ${acc.status === 'connected' ? '🟢 Подключен' : '🔴 Отключен'}\n\n` +
+    `Для переподключения:\n` +
+    `1. Откройте WhatsApp на телефоне\n` +
+    `2. Нажмите "📷 QR-код (рекомендуется)" в меню\n` +
+    `3. Отсканируйте код WhatsApp\n\n` +
+    `Или нажмите "◀️ Назад" и выберите "🔄 Проверить статус"`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [Markup.button.callback('📷 QR-код (рекомендуется)', 'add_qr')],
+          [Markup.button.callback('◀️ Назад', `acc_${accountId}`)]
+        ]
+      }
+    }
+  );
+});
+
 // === BROADCAST ===
 bot.action('broadcast_menu', async (ctx) => {
   await safeAnswerCb(ctx);
@@ -2521,6 +2613,96 @@ bot.on('text', async (ctx) => {
       userStates.delete(ctx.from!.id);
       return;
     }
+
+    // === НАСТРОЙКА ЛИМИТА СООБЩЕНИЙ ДЛЯ ПАУЗЫ ===
+    if (state.action === 'waiting_pause_messages') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      if (!acc) {
+        userStates.delete(ctx.from!.id);
+        await safeReply(ctx, '❌ Аккаунт не найден');
+        return;
+      }
+
+      const messagesCount = parseInt(ctx.message.text.trim());
+      if (isNaN(messagesCount) || messagesCount < 10 || messagesCount > 500) {
+        await safeReply(ctx, '❌ Введите число от 10 до 500');
+        return;
+      }
+
+      // Сохраняем лимит сообщений и запрашиваем длительность паузы
+      (acc as any).messagesBeforePause = messagesCount;
+      saveAccountsData();
+      userStates.set(ctx.from!.id, { action: 'waiting_pause_duration', accountId });
+
+      await safeReply(ctx,
+        `✅ Лимит сообщений: ${messagesCount}\n\n` +
+        `🛡️ *Настройка защиты от бана*\n\n` +
+        `📝 Лимит: ${messagesCount} сообщений\n\n` +
+        `⏱ Введите длительность паузы (в минутах):\n` +
+        `Рекомендуется: 30-120 минут\n` +
+        `Диапазон: 10-300`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('◀️ Назад', `acc_${accountId}`)]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    // === НАСТРОЙКА ДЛИТЕЛЬНОСТИ ПАУЗЫ ===
+    if (state.action === 'waiting_pause_duration') {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      if (!acc) {
+        userStates.delete(ctx.from!.id);
+        await safeReply(ctx, '❌ Аккаунт не найден');
+        return;
+      }
+
+      const pauseMinutes = parseInt(ctx.message.text.trim());
+      if (isNaN(pauseMinutes) || pauseMinutes < 10 || pauseMinutes > 300) {
+        await safeReply(ctx, '❌ Введите число от 10 до 300 минут');
+        return;
+      }
+
+      // Сохраняем длительность паузы
+      (acc as any).pauseDurationMinutes = pauseMinutes;
+      saveAccountsData();
+      userStates.delete(ctx.from!.id);
+
+      const messagesLimit = (acc as any).messagesBeforePause || 100;
+
+      await safeReply(ctx,
+        `✅ *Настройки защиты сохранены!*\n\n` +
+        `🛡️ *Защита от бана*\n\n` +
+        `📝 После ${messagesLimit} сообщений → пауза ${pauseMinutes} мин\n` +
+        `❌ После 3 ошибок → пауза 1 час\n` +
+        `🔴 После 2 таких пауз → полная остановка\n\n` +
+        `📱 Аккаунт: ${acc.name || acc.phone}`,
+        { parse_mode: 'Markdown' }
+      );
+
+      await safeEdit(ctx,
+        `✅ *Защита от бана настроена!*\n\n` +
+        `🛡️ *Текущие настройки:*\n` +
+        `📝 Лимит: ${messagesLimit} msg\n` +
+        `⏱ Пауза: ${pauseMinutes} мин`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [Markup.button.callback('◀️ К аккаунту', `acc_${accountId}`)]
+            ]
+          }
+        }
+      );
+      return;
+    }
   } catch (error) {
     console.error('Error in text handler:', error);
     await safeReply(ctx, '❌ Ошибка: ' + (error as Error).message);
@@ -2602,8 +2784,10 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
     joinDelay: 10,      // По умолчанию 10 минут
     isBroadcasting: false,
     isJoining: false,
-    autoJoinPending: true
-  });
+    autoJoinPending: true,
+    messagesBeforePause: 100,  // По умолчанию 100 сообщений
+    pauseDurationMinutes: 10   // По умолчанию 10 минут
+  } as any);
 
   let qrAttempts = 0;
   const maxQrAttempts = 3;
@@ -2816,15 +3000,17 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     acc.isBroadcasting = false;
     return safeReply(ctx, '❌ Этот аккаунт выключен для рассылки');
   }
-  if (acc.sentToday >= MAX_MESSAGES_PER_DAY) {
-    isBroadcasting = false;
-    acc.isBroadcasting = false;
-    return safeReply(ctx, `❌ Достигнут дневной лимит (${MAX_MESSAGES_PER_DAY} сообщений)`);
-  }
 
   await safeReply(ctx, '🔍 Поиск архивных чатов...');
 
   try {
+    // Проверяем подключение аккаунта
+    if (acc.status !== 'connected') {
+      isBroadcasting = false;
+      acc.isBroadcasting = false;
+      return safeReply(ctx, '❌ Аккаунт отключился! Используйте "🔄 Проверить статус" для восстановления.');
+    }
+
     const chats = await acc.client.getChats();
     const archivedChats = chats.filter((chat: any) => chat.archived);
     if (archivedChats.length === 0) {
@@ -2836,7 +3022,23 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     const groups = archivedChats.filter((c: any) => c.isGroup);
     const individuals = archivedChats.filter((c: any) => !c.isGroup);
     const broadcastId = Date.now().toString();
-    activeBroadcasts.set(broadcastId, { stop: false, sent: 0, failed: 0, total: archivedChats.length, accountId });
+
+    // Получаем настройки из аккаунта или используем значения по умолчанию
+    const messagesBeforePause = (acc as any).messagesBeforePause || 100;
+    const pauseDurationMinutes = (acc as any).pauseDurationMinutes || 10;
+
+    activeBroadcasts.set(broadcastId, {
+      stop: false,
+      sent: 0,
+      failed: 0,
+      consecutiveErrors: 0,
+      total: archivedChats.length,
+      accountId,
+      messagesBeforePause,
+      pauseDurationMinutes,
+      isPaused: false,
+      messagesSincePause: 0
+    });
 
     const broadcastDelay = getBroadcastDelay(accountId);
     const estimatedMin = Math.ceil(archivedChats.length * (broadcastDelay / 60000));
@@ -2847,7 +3049,7 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       `🔔 *Рассылка началась!*\n\n` +
       `📱 Аккаунт: ${acc.name || acc.phone}\n` +
       `📊 Найдено: ${archivedChats.length} чатов\n   👥 Групп: ${groups.length}\n   👤 Диалогов: ${individuals.length}\n\n` +
-      `🛡️ *Защита:*\n   ⏱ Задержка: ${acc.broadcastDelay} мин (±1 мин)\n   📊 Лимит: БЕЗ ОГРАНИЧЕНИЙ\n\n` +
+      `🛡️ *Защита от бана:*\n   ⏱ Задержка: ${acc.broadcastDelay} мин (±1 мин)\n   📊 Пауза после: ${messagesBeforePause} сообщений\n   ⏸ Длительность паузы: ${pauseDurationMinutes} мин\n   ❌ Стоп после: ${MAX_CONSECUTIVE_ERRORS} ошибок подряд\n\n` +
       `⏱ Примерное время: ~${hours}ч ${mins}мин\n\n` +
       `⏳ Рассылка по кругу пока не остановите...`,
       {
@@ -2864,10 +3066,18 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
     let failed = 0;
     let loopCount = 0;
     let chatIndex = 0;
+    let errorPauseCycles = 0;
 
     while (true) {
       const broadcast = activeBroadcasts.get(broadcastId);
-      if (broadcast?.stop) {
+      if (!broadcast) {
+        // Рассылка была удалена извне
+        isBroadcasting = false;
+        acc.isBroadcasting = false;
+        return;
+      }
+
+      if (broadcast.stop) {
         isBroadcasting = false;
         acc.isBroadcasting = false;
         await safeReply(ctx,
@@ -2878,9 +3088,81 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
         return;
       }
 
-      if (acc.sentToday >= MAX_MESSAGES_PER_DAY) {
-        // Этот код теперь не выполнится т.к. лимит отключён
-        // Но оставим для совместимости
+      // === ПРОВЕРКА ОТКЛЮЧЕНИЯ АККАУНТА ===
+      if (acc.status !== 'connected') {
+        isBroadcasting = false;
+        acc.isBroadcasting = false;
+        broadcast.stop = true;
+        await safeReply(ctx,
+          `⚠️ *Аккаунт отключился!*\n\n` +
+          `✅ Отправлено до отключения: ${sent}\n` +
+          `❌ Ошибок: ${failed}\n\n` +
+          `🔄 Используйте "🔄 Проверить статус" для восстановления и продолжения рассылки.`,
+          { parse_mode: 'Markdown' }
+        );
+        activeBroadcasts.delete(broadcastId);
+        return;
+      }
+
+      // === ПРОВЕРКА ПАУЗЫ ===
+      if (broadcast.isPaused) {
+        const now = Date.now();
+        if (broadcast.pauseEndTime && now < broadcast.pauseEndTime) {
+          const remainingMin = Math.ceil((broadcast.pauseEndTime - now) / 60000);
+          // Обновляем статус каждые 30 секунд
+          if (remainingMin % 1 === 0) {
+            await safeReply(ctx,
+              `⏸ *ПАУЗА*\n\n` +
+              `⏱ Осталось: ~${remainingMin} мин\n` +
+              `📊 Отправлено: ${sent} | ❌ Ошибок: ${failed}\n` +
+              `📊 За сегодня: ${acc.sentToday}`,
+              {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [
+                    [Markup.button.callback('⏹ СТОП РАССЫЛКУ', `stop_broadcast_${broadcastId}`)]
+                  ]
+                }
+              }
+            );
+          }
+          await new Promise(r => setTimeout(r, 30000));
+          continue;
+        } else {
+          // Пауза закончилась
+          broadcast.isPaused = false;
+          broadcast.pauseEndTime = undefined;
+          broadcast.messagesSincePause = 0;
+          broadcast.consecutiveErrors = 0;
+          await safeReply(ctx,
+            `✅ *Пауза завершена!*\n\n` +
+            `📊 Продолжаем рассылку...\n` +
+            `📊 Отправлено: ${sent} | ❌ Ошибок: ${failed}`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      }
+
+      // === ПРОВЕРКА ЛИМИТА СООБЩЕНИЙ ПЕРЕД ПАУЗОЙ ===
+      if (broadcast.messagesSincePause >= broadcast.messagesBeforePause) {
+        broadcast.isPaused = true;
+        broadcast.pauseEndTime = Date.now() + (broadcast.pauseDurationMinutes * 60000);
+        broadcast.messagesSincePause = 0;
+        await safeReply(ctx,
+          `⏸ *ПАУЗА*\n\n` +
+          `📊 Достигнут лимит ${broadcast.messagesBeforePause} сообщений\n` +
+          `⏱ Пауза: ${broadcast.pauseDurationMinutes} мин\n\n` +
+          `📊 За сегодня: ${acc.sentToday}`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [Markup.button.callback('⏹ СТОП РАССЫЛКУ', `stop_broadcast_${broadcastId}`)]
+              ]
+            }
+          }
+        );
+        await new Promise(r => setTimeout(r, broadcast.pauseDurationMinutes * 60000));
         continue;
       }
 
@@ -2888,8 +3170,18 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
         chatIndex = 0;
         loopCount++;
         await safeReply(ctx,
-          `🔄 *Новый круг рассылки #${loopCount + 1}*\n\n✅ Отправлено: ${sent}\n❌ Ошибок: ${failed}\n📊 За сегодня: ${acc.sentToday}`,
-          { parse_mode: 'Markdown' }
+          `🔄 *Новый круг рассылки #${loopCount + 1}*\n\n` +
+          `✅ Отправлено: ${sent}\n` +
+          `❌ Ошибок: ${failed}\n` +
+          `📊 За сегодня: ${acc.sentToday}`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [Markup.button.callback('⏹ СТОП РАССЫЛКУ', `stop_broadcast_${broadcastId}`)]
+              ]
+            }
+          }
         );
       }
 
@@ -2904,25 +3196,106 @@ async function startBroadcast(ctx: any, accountId: string, text: string) {
       console.log(`[Круг ${loopCount + 1}, ${chatIndex + 1}/${archivedChats.length}] Sending to: ${chat.name || chatId}`);
 
       try {
+        // Проверяем подключение перед каждым сообщением
+        if (acc.status !== 'connected') {
+          broadcast.stop = true;
+          isBroadcasting = false;
+          acc.isBroadcasting = false;
+          await safeReply(ctx,
+            `⚠️ *Аккаунт отключился!*\n\n` +
+            `✅ Отправлено: ${sent}\n` +
+            `❌ Ошибок: ${failed}`,
+            { parse_mode: 'Markdown' }
+          );
+          activeBroadcasts.delete(broadcastId);
+          return;
+        }
+
         const success = await sendMessageWithRetry(acc.client, chatId, text, currentMsgNum, 3);
         if (success) {
           sent++;
           acc.sentToday++;
+          broadcast.sent++;
+          broadcast.consecutiveErrors = 0; // Сбрасываем счетчик ошибок при успехе
+          broadcast.messagesSincePause++;
         } else {
           failed++;
           acc.failedToday++;
+          broadcast.failed++;
+          broadcast.consecutiveErrors++;
+
+          // === ЗАЩИТА ОТ БАНА: 3 ошибки подряд ===
+          if (broadcast.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+            errorPauseCycles++;
+            if (errorPauseCycles >= MAX_ERROR_PAUSE_CYCLES) {
+              // После 2 циклов пауз - полная остановка
+              broadcast.stop = true;
+              isBroadcasting = false;
+              acc.isBroadcasting = false;
+              await safeReply(ctx,
+                `🛑 *РАССЫЛКА ОСТАНОВЛЕНА*\n\n` +
+                `❌ Слишком много ошибок (${MAX_CONSECUTIVE_ERRORS} подряд x${errorPauseCycles})\n` +
+                `📊 Отправлено: ${sent}\n` +
+                `❌ Ошибок: ${failed}\n` +
+                `📊 За сегодня: ${acc.sentToday}\n\n` +
+                `⚠️ Аккаунт возможно заблокирован.\n` +
+                `🔄 Используйте "🔄 Проверить статус" для диагностики.`,
+                { parse_mode: 'Markdown' }
+              );
+              activeBroadcasts.delete(broadcastId);
+              return;
+            } else {
+              // Пауза 1 час
+              broadcast.isPaused = true;
+              broadcast.pauseEndTime = Date.now() + (ERROR_PAUSE_DURATION * 60000);
+              broadcast.consecutiveErrors = 0;
+              await safeReply(ctx,
+                `⏸ *ПАУЗА ИЗ-ЗА ОШИБОК*\n\n` +
+                `❌ ${MAX_CONSECUTIVE_ERRORS} ошибки подряд!\n` +
+                `⏱ Пауза: ${ERROR_PAUSE_DURATION} минут\n` +
+                `📊 Цикл: ${errorPauseCycles}/${MAX_ERROR_PAUSE_CYCLES}\n\n` +
+                `⚠️ Если ошибки повторятся - рассылка будет остановлена.`,
+                {
+                  parse_mode: 'Markdown',
+                  reply_markup: {
+                    inline_keyboard: [
+                      [Markup.button.callback('⏹ СТОП РАССЫЛКУ', `stop_broadcast_${broadcastId}`)]
+                    ]
+                  }
+                }
+              );
+              await new Promise(r => setTimeout(r, ERROR_PAUSE_DURATION * 60000));
+              continue;
+            }
+          }
         }
 
+        // Обновляем прогресс каждые 3 сообщения
         if (currentMsgNum % 3 === 0) {
+          let pauseInfo = '';
+          if (broadcast.isPaused) {
+            const remainingMin = broadcast.pauseEndTime ? Math.ceil((broadcast.pauseEndTime - Date.now()) / 60000) : 0;
+            pauseInfo = `\n⏸ До паузы: ${broadcast.messagesBeforePause - broadcast.messagesSincePause}`;
+          }
           await safeReply(ctx,
-            `📊 Круг ${loopCount + 1} | Сообщение ${chatIndex + 1}/${archivedChats.length}\n` +
-            `✅ ${sent} | ❌ ${failed}\n` +
-            `📊 За сегодня: ${acc.sentToday}`
+            `📊 Круг ${loopCount + 1} | ${chatIndex + 1}/${archivedChats.length}\n` +
+            `✅ ${sent} | ❌ ${failed}${pauseInfo}\n` +
+            `📊 За сегодня: ${acc.sentToday}`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [Markup.button.callback('⏹ СТОП', `stop_broadcast_${broadcastId}`)]
+                ]
+              }
+            }
           );
         }
       } catch (error) {
         failed++;
         acc.failedToday++;
+        broadcast.failed++;
+        broadcast.consecutiveErrors++;
+        console.error(`Message send error:`, error);
       }
 
       chatIndex++;
