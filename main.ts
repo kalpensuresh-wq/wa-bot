@@ -129,13 +129,17 @@ async function restoreExistingAccounts(): Promise<void> {
       isJoining: false,
       autoJoinPending: accData.autoJoinPending || false,
       messagesBeforePause: accData.messagesBeforePause || 100,
-      pauseDurationMinutes: accData.pauseDurationMinutes || 10
+      pauseDurationMinutes: accData.pauseDurationMinutes || 10,
+      isSleeping: false,
+      lastActivity: Date.now(),
+      sleepCooldown: 0
     } as any);
 
     client.on('ready', async () => {
       const acc = waAccounts.get(accountId);
       if (acc) {
         acc.status = 'connected';
+        acc.lastActivity = Date.now();
         console.log(`✅ Account restored: ${accountId} (${acc.phone})`);
         saveAccountsData();
       }
@@ -254,7 +258,7 @@ const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
 // Хранилище аккаунтов
 const waAccounts = new Map<string, {
   client: Client;
-  status: 'disconnected' | 'connecting' | 'connected';
+  status: 'disconnected' | 'connecting' | 'connected' | 'sleeping';
   phone?: string;
   name: string;
   customMessage: string;
@@ -266,7 +270,16 @@ const waAccounts = new Map<string, {
   isBroadcasting: boolean;    // Активна ли рассылка
   isJoining: boolean;          // Активен ли процесс присоединения
   autoJoinPending: boolean;    // Авто-повтор для pending групп
+  isSleeping: boolean;        // Спящий режим
+  lastActivity: number;       // Время последней активности
+  sleepCooldown: number;      // Кулдаун до активации сна (мс)
 }>();
+
+// === КОНФИГУРАЦИЯ СПЯЩЕГО РЕЖИМА ===
+const SLEEP_INACTIVITY_THRESHOLD = 30 * 60 * 1000; // 30 минут без активности
+const SLEEP_WAKEUP_INTERVAL = 10 * 60 * 1000;       // Проверка каждые 10 минут
+const MAX_ACTIVE_ACCOUNTS = 2;                       // Максимум 2 активных аккаунта
+const SLEEP_BROADCAST_DELAY = 5 * 60 * 1000;        // 5 минут доп. задержки после выхода из сна
 
 const userStates = new Map<number, { action: string; accountId?: string; chatCount?: number }>();
 const activeBroadcasts = new Map<string, {
@@ -826,6 +839,204 @@ async function refreshAccountsStatus(): Promise<void> {
   saveAccountsData();
 }
 
+// === ФУНКЦИИ СПЯЩЕГО РЕЖИМА ===
+
+// Обновить время последней активности аккаунта
+function updateAccountActivity(accountId: string): void {
+  const acc = waAccounts.get(accountId);
+  if (acc) {
+    acc.lastActivity = Date.now();
+  }
+}
+
+// Проверить, нужно ли перевести аккаунт в спящий режим
+async function shouldSleepAccount(accountId: string): Promise<boolean> {
+  const acc = waAccounts.get(accountId);
+  if (!acc) return false;
+
+  // Не спим если идёт рассылка или присоединение
+  if (acc.isBroadcasting || acc.isJoining) return false;
+
+  // Не спим если аккаунт не подключен
+  if (acc.status !== 'connected') return false;
+
+  // Проверяем время без активности
+  const inactiveTime = Date.now() - (acc.lastActivity || 0);
+  if (inactiveTime < SLEEP_INACTIVITY_THRESHOLD) return false;
+
+  // Проверяем что не превышаем лимит активных аккаунтов
+  const activeCount = [...waAccounts.values()].filter(a =>
+    a.status === 'connected' && !a.isSleeping &&
+    (a.isBroadcasting || a.isJoining || (Date.now() - (a.lastActivity || 0) < SLEEP_INACTIVITY_THRESHOLD))
+  ).length;
+
+  return activeCount >= MAX_ACTIVE_ACCOUNTS;
+}
+
+// Перевести аккаунт в спящий режим (освободить память)
+async function sleepAccount(accountId: string): Promise<void> {
+  const acc = waAccounts.get(accountId);
+  if (!acc || acc.isSleeping) return;
+
+  console.log(`💤 Putting account ${accountId} to sleep...`);
+
+  try {
+    // Сохраняем состояние
+    saveAccountsData();
+
+    // Уничтожаем клиент для освобождения памяти (Chrome)
+    if (acc.client) {
+      try {
+        await acc.client.destroy();
+      } catch (e) {
+        // Игнорируем ошибки
+      }
+    }
+
+    acc.isSleeping = true;
+    acc.status = 'sleeping';
+    acc.client = null as any;
+
+    console.log(`💤 Account ${accountId} is now sleeping (memory freed)`);
+
+    // Уведомляем админов
+    const msg = `💤 *Спящий режим аккаунта*\n\n📱 Аккаунт: ${acc.name || acc.phone || accountId}\n\n🔋 Экономия памяти: ~150MB`;
+    for (const adminId of ADMIN_IDS) {
+      try {
+        await bot.telegram.sendMessage(adminId, msg, { parse_mode: 'Markdown' });
+      } catch (e) {}
+    }
+  } catch (error) {
+    console.error(`Failed to sleep account ${accountId}:`, error);
+  }
+}
+
+// Разбудить аккаунт из спящего режима
+async function wakeupAccount(accountId: string): Promise<boolean> {
+  const acc = waAccounts.get(accountId);
+  if (!acc || !acc.isSleeping) return false;
+
+  console.log(`🌅 Waking up account ${accountId}...`);
+
+  try {
+    // Создаём новый клиент
+    const sessionsBasePath = process.env.WA_SESSIONS_PATH || '/data/wa-sessions';
+    const sessionPath = `${sessionsBasePath}/${accountId}`;
+
+    const client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: accountId,
+        dataPath: sessionPath,
+      }),
+      puppeteer: {
+        headless: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu',
+          '--disable-web-security',
+          '--disable-features=IsolateOrigins,site-per-process',
+          '--disable-background-networking',
+          '--disable-default-apps',
+          '--disable-extensions',
+          '--disable-sync',
+          '--disable-translate',
+          '--metrics-recording-only',
+          '--mute-audio',
+          '--no-first-run',
+          '--safebrowsing-disable-auto-update',
+        ],
+        ignoreHTTPSErrors: true,
+      },
+    });
+
+    acc.client = client;
+    acc.status = 'connecting';
+    acc.isSleeping = false;
+    acc.lastActivity = Date.now();
+
+    // Обработчики событий
+    client.on('ready', async () => {
+      const account = waAccounts.get(accountId);
+      if (account) {
+        account.status = 'connected';
+        account.lastActivity = Date.now();
+        console.log(`✅ Account ${accountId} woke up successfully!`);
+        saveAccountsData();
+      }
+    });
+
+    client.on('disconnected', async () => {
+      const account = waAccounts.get(accountId);
+      if (account) {
+        account.status = 'disconnected';
+        console.log(`⚠️ Account ${accountId} disconnected after wakeup`);
+        saveAccountsData();
+      }
+    });
+
+    await client.initialize();
+    return true;
+  } catch (error) {
+    console.error(`Failed to wakeup account ${accountId}:`, error);
+    acc.status = 'disconnected';
+    acc.isSleeping = false;
+    return false;
+  }
+}
+
+// Диспетчер спящего режима - вызывается периодически
+async function sleepManager(): Promise<void> {
+  const now = Date.now();
+
+  for (const [accountId, acc] of waAccounts) {
+    // Проверяем спящие аккаунты - будим если есть активные задачи
+    if (acc.isSleeping) {
+      // Будим если аккаунт включен и готов к работе
+      if (acc.enabled && acc.autoJoinPending) {
+        // Можно разбудить при необходимости
+      }
+      continue;
+    }
+
+    // Проверяем активные аккаунты
+    if (acc.status === 'connected' && !acc.isBroadcasting && !acc.isJoining) {
+      const inactiveTime = now - (acc.lastActivity || 0);
+
+      // Если неактивны слишком долго и активных слишком много
+      if (inactiveTime >= SLEEP_INACTIVITY_THRESHOLD) {
+        const activeAccounts = [...waAccounts.values()].filter(a =>
+          a.status === 'connected' && !a.isSleeping &&
+          (a.isBroadcasting || a.isJoining || (now - (a.lastActivity || 0) < SLEEP_INACTIVITY_THRESHOLD))
+        );
+
+        if (activeAccounts.length > MAX_ACTIVE_ACCOUNTS) {
+          await sleepAccount(accountId);
+        }
+      }
+    }
+  }
+}
+
+// Запускаем диспетчер спящего режима
+setInterval(() => {
+  sleepManager().catch(err => console.error('Sleep manager error:', err));
+}, SLEEP_WAKEUP_INTERVAL);
+
+// Обновить lastActivity для аккаунта
+function touchAccount(accountId: string): void {
+  const acc = waAccounts.get(accountId);
+  if (acc) {
+    acc.lastActivity = Date.now();
+  }
+}
+
 function extractInviteCode(link: string): string | null {
   const patterns = [
     /chat\.whatsapp\.com\/([a-zA-Z0-9]{20,})/i,
@@ -1023,8 +1234,11 @@ const accountsMenu = (accountId?: string) => {
   if (accountId) {
     const acc = waAccounts.get(accountId);
     if (acc) {
-      const statusEmoji = acc.status === 'connected' ? '🟢' : acc.status === 'connecting' ? '🔄' : '🔴';
+      const statusEmoji = acc.status === 'connected' ? '🟢' :
+                         acc.status === 'connecting' ? '🔄' :
+                         acc.status === 'sleeping' ? '💤' : '🔴';
       const enabledEmoji = acc.enabled ? '✅' : '❌';
+      const sleepIndicator = acc.isSleeping ? ' 💤' : '';
       buttons.push([Markup.button.callback(`${enabledEmoji} Рассылка: ${acc.enabled ? 'ВКЛ' : 'ВЫКЛ'}`, `toggle_${accountId}`)]);
       if (acc.status === 'connected') {
         buttons.push([Markup.button.callback('📝 Изменить текст', `edit_msg_${accountId}`)]);
@@ -1039,6 +1253,10 @@ const accountsMenu = (accountId?: string) => {
         const autoText = acc.autoJoinPending ? '🔄 Авто-повтор: ВКЛ' : '🔄 Авто-повтор: ВЫКЛ';
         buttons.push([Markup.button.callback(autoText, `toggle_auto_pending_${accountId}`)]);
         buttons.push([Markup.button.callback('🔍 Просмотр чатов', `view_chats_${accountId}`)]);
+      } else if (acc.isSleeping) {
+        // Для спящих аккаунтов
+        buttons.push([Markup.button.callback('🌅 Разбудить', `wakeup_${accountId}`)]);
+        buttons.push([Markup.button.callback('📷 Переподключить (QR)', `reconnect_qr_${accountId}`)]);
       } else {
         // Для отключенных аккаунтов показываем кнопку переподключения
         buttons.push([Markup.button.callback('📷 Переподключить (QR)', `reconnect_qr_${accountId}`)]);
@@ -1050,10 +1268,13 @@ const accountsMenu = (accountId?: string) => {
   } else {
     if (waAccounts.size > 0) {
       waAccounts.forEach((acc, id) => {
-        const emoji = acc.status === 'connected' ? '🟢' : acc.status === 'connecting' ? '🔄' : '🔴';
+        const emoji = acc.status === 'connected' ? '🟢' :
+                      acc.status === 'connecting' ? '🔄' :
+                      acc.status === 'sleeping' ? '💤' : '🔴';
         const enabledEmoji = acc.enabled ? '✅' : '❌';
+        const sleepInfo = acc.isSleeping ? ' (спит)' : '';
         // Все аккаунты кликабельны, проверка статуса в обработчике
-        buttons.push([Markup.button.callback(`${emoji} ${enabledEmoji} ${acc.name || acc.phone || id}`, `acc_${id}`)]);
+        buttons.push([Markup.button.callback(`${emoji} ${enabledEmoji} ${acc.name || acc.phone || id}${sleepInfo}`, `acc_${id}`)]);
       });
       buttons.push([Markup.button.callback('🔄 Проверить все статусы', 'refresh_all_accounts')]);
     }
@@ -1815,6 +2036,12 @@ bot.action(/^refresh_acc_(.+)$/, async (ctx) => {
     return;
   }
 
+  // Обработка спящего аккаунта
+  if (acc.isSleeping) {
+    await safeReply(ctx, '💤 Аккаунт в спящем режиме. Нажмите "🌅 Разбудить" для активации.');
+    return;
+  }
+
   const wasConnected = acc.status === 'connected';
   if (acc.client) {
     const valid = await isSessionValid(acc.client);
@@ -2181,6 +2408,31 @@ bot.action(/^stop_broadcast_(.+)$/, async (ctx) => {
   const acc = waAccounts.get(broadcast.accountId);
   await safeReply(ctx, `⏹ Команда остановки отправлена для рассылки!`);
   await safeEdit(ctx, `⏹ *Рассылка останавливается...*\n\n📱 Аккаунт: ${acc?.name || acc?.phone || 'неизвестен'}\n\n⏳ Дождитесь завершения текущего сообщения...`, { parse_mode: 'Markdown' });
+});
+
+// === WAKEUP SLEEPING ACCOUNT ===
+bot.action(/^wakeup_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx, 'Разбуждаем...');
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+
+  const acc = waAccounts.get(accountId);
+  if (!acc) {
+    await safeReply(ctx, '❌ Аккаунт не найден');
+    return;
+  }
+
+  if (!acc.isSleeping) {
+    await safeReply(ctx, 'ℹ️ Аккаунт не в спящем режиме');
+    return;
+  }
+
+  const success = await wakeupAccount(accountId);
+  if (success) {
+    await safeReply(ctx, `🌅 Аккаунт разбужен! Подключение...`);
+  } else {
+    await safeReply(ctx, '❌ Не удалось разбудить аккаунт. Попробуйте QR.');
+  }
 });
 
 // === SETTINGS ===
@@ -2786,7 +3038,10 @@ async function addNewAccount(ctx: any, phone: string, authMethod: 'qr' | 'pairin
     isJoining: false,
     autoJoinPending: true,
     messagesBeforePause: 100,  // По умолчанию 100 сообщений
-    pauseDurationMinutes: 10   // По умолчанию 10 минут
+    pauseDurationMinutes: 10,   // По умолчанию 10 минут
+    isSleeping: false,
+    lastActivity: Date.now(),
+    sleepCooldown: 0
   } as any);
 
   let qrAttempts = 0;
@@ -3671,11 +3926,14 @@ function startSessionKeepalive() {
               newClient.on('ready', async () => {
                 acc.client = newClient;
                 acc.status = 'connected';
+                acc.lastActivity = Date.now();
+                acc.isSleeping = false;
                 console.log(`  ✅ Session ${id} reconnected successfully!`);
               });
 
               newClient.on('disconnected', async () => {
                 acc.status = 'disconnected';
+                acc.lastActivity = Date.now();
                 console.log(`  ⚠️ Session ${id} disconnected again`);
                 // ONE-TIME уведомление
                 const now = Date.now();
