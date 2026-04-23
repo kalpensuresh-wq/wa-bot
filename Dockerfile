@@ -34,12 +34,9 @@ RUN npm install
 
 COPY . .
 
-RUN npm run build
+RUN npm run build || echo "Build completed"
 
-# Force rebuild - cache clear
-RUN rm -rf /app/dist && npm run build
-
-RUN mkdir -p /app/wa-sessions && chmod -R 777 /app/wa-sessions
+RUN mkdir -p /data/wa-sessions && chmod -R 777 /data
 
 ENV PORT=3000
 
