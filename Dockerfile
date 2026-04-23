@@ -28,8 +28,8 @@ ENV NODE_ENV=production
 
 WORKDIR /app
 
-COPY package.json ./
-
+COPY package*.json ./
+RUN rm -f yarn.lock
 RUN npm install
 
 COPY . .
