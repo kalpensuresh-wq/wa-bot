@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import express from 'express';
 import 'dotenv/config';
+import { ProxyAgent } from 'proxy-agent';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,6 +21,7 @@ interface AccountData {
   broadcastDelay: number;
   messagesBeforePause: number;
   pauseDurationMinutes: number;
+  proxy?: string;
 }
 
 function saveAccountsData(): void {
@@ -35,7 +37,8 @@ function saveAccountsData(): void {
         failedToday: acc.failedToday,
         broadcastDelay: acc.broadcastDelay || 10,
         messagesBeforePause: (acc as any).messagesBeforePause || 100,
-        pauseDurationMinutes: (acc as any).pauseDurationMinutes || 10
+        pauseDurationMinutes: (acc as any).pauseDurationMinutes || 10,
+        proxy: (acc as any).proxy || ''
       };
     });
     const dir = ACCOUNTS_FILE_PATH.substring(0, ACCOUNTS_FILE_PATH.lastIndexOf('/'));
@@ -60,6 +63,60 @@ function loadAccountsData(): { [id: string]: AccountData } {
   return {};
 }
 
+function createClient(accountId: string, proxy?: string): Client {
+  const sessionsBasePath = process.env.WA_SESSIONS_PATH || '/data/wa-sessions';
+  const sessionPath = `${sessionsBasePath}/${accountId}`;
+
+  const puppeteerOptions: any = {
+    headless: true,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-background-networking',
+      '--disable-extensions',
+      '--mute-audio',
+      // RAM optimization args
+      '--disable-logging',
+      '--log-level=3',
+      '--disable-cache',
+      '--disable-application-cache',
+      '--disable-images',
+      '--disable-javascript-harmony-shipping',
+      '--disable-renderer-backgrounding',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-hang-monitor',
+      '--disable-prompt-on-repost',
+      '--disable-collapse-stateful-node',
+      '--disable-ipc-flooding-protection',
+    ],
+    ignoreHTTPSErrors: true,
+  };
+
+  if (proxy) {
+    const proxyAgent = new ProxyAgent(proxy);
+    puppeteerOptions.proxyAgent = proxyAgent;
+    console.log(`Using proxy for ${accountId}: ${proxy}`);
+  }
+
+  return new Client({
+    authStrategy: new LocalAuth({
+      clientId: accountId,
+      dataPath: sessionPath,
+    }),
+    puppeteer: puppeteerOptions,
+  });
+}
+
 async function restoreExistingAccounts(): Promise<void> {
   const savedAccounts = loadAccountsData();
   const sessionsBasePath = process.env.WA_SESSIONS_PATH || '/data/wa-sessions';
@@ -74,32 +131,7 @@ async function restoreExistingAccounts(): Promise<void> {
 
     console.log(`Restoring account: ${accountId} (${accData.phone})`);
 
-    const client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: accountId,
-        dataPath: sessionPath,
-      }),
-      puppeteer: {
-        headless: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process',
-          '--disable-gpu',
-          '--disable-web-security',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-background-networking',
-          '--disable-extensions',
-          '--mute-audio',
-        ],
-        ignoreHTTPSErrors: true,
-      },
-    });
+    const client = createClient(accountId, accData.proxy);
 
     waAccounts.set(accountId, {
       client,
@@ -116,7 +148,8 @@ async function restoreExistingAccounts(): Promise<void> {
       lastActivity: Date.now(),
       sleepCooldown: 0,
       messagesBeforePause: accData.messagesBeforePause || 100,
-      pauseDurationMinutes: accData.pauseDurationMinutes || 10
+      pauseDurationMinutes: accData.pauseDurationMinutes || 10,
+      proxy: accData.proxy || ''
     } as any);
 
     client.on('ready', async () => {
@@ -343,31 +376,8 @@ async function wakeupAccount(accountId: string): Promise<boolean> {
   console.log(`Waking up account ${accountId}...`);
 
   try {
-    const sessionsBasePath = process.env.WA_SESSIONS_PATH || '/data/wa-sessions';
-    const sessionPath = `${sessionsBasePath}/${accountId}`;
-
-    const client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: accountId,
-        dataPath: sessionPath,
-      }),
-      puppeteer: {
-        headless: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--single-process',
-          '--disable-gpu',
-          '--disable-web-security',
-          '--disable-background-networking',
-          '--disable-extensions',
-          '--mute-audio',
-        ],
-        ignoreHTTPSErrors: true,
-      },
-    });
+    const proxy = (acc as any).proxy || '';
+    const client = createClient(accountId, proxy);
 
     acc.client = client;
     acc.status = 'connecting';
@@ -457,6 +467,8 @@ const accountsMenu = (accountId?: string) => {
         const messagesBeforePause = (acc as any).messagesBeforePause || 100;
         const pauseDurationMinutes = (acc as any).pauseDurationMinutes || 10;
         buttons.push([Markup.button.callback(`Pause: ${messagesBeforePause} msg / ${pauseDurationMinutes} min`, `set_pause_limit_${accountId}`)]);
+        const proxyStatus = (acc as any).proxy ? 'ON' : 'OFF';
+        buttons.push([Markup.button.callback(`Proxy: ${proxyStatus}`, `set_proxy_${accountId}`)]);
         buttons.push([Markup.button.callback('View chats', `view_chats_${accountId}`)]);
       } else if (acc.isSleeping) {
         buttons.push([Markup.button.callback('Wake up', `wakeup_${accountId}`)]);
@@ -776,6 +788,28 @@ bot.action(/^set_pause_limit_(.+)$/, async (ctx) => {
   );
 });
 
+bot.action(/^set_proxy_(.+)$/, async (ctx) => {
+  await safeAnswerCb(ctx);
+  const accountId = ctx.match?.[1];
+  if (!accountId) return;
+
+  userStates.set(ctx.from!.id, { action: 'waiting_proxy', accountId });
+  const acc = waAccounts.get(accountId);
+  const currentProxy = (acc as any).proxy || 'Not set';
+
+  await safeEdit(ctx,
+    `Proxy settings\n\n` +
+    `Current: ${currentProxy}\n\n` +
+    `Enter proxy URL:\n` +
+    `http://user:pass@host:port\n` +
+    `or leave empty to remove`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('Cancel', `acc_${accountId}`)]])
+    }
+  );
+});
+
 bot.action(/^unbind_(.+)$/, async (ctx) => {
   await safeAnswerCb(ctx);
   const accountId = ctx.match?.[1];
@@ -845,14 +879,8 @@ bot.action('restart_all', async (ctx) => {
 
         if (!fs.existsSync(sessionsPath)) continue;
 
-        const client = new Client({
-          authStrategy: new LocalAuth({ clientId: id, dataPath: sessionsPath }),
-          puppeteer: {
-            headless: true,
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process', '--disable-gpu'],
-          },
-        });
+        const proxy = (acc as any).proxy || '';
+        const client = createClient(id, proxy);
 
         acc.client = client;
         acc.status = 'connecting';
@@ -986,24 +1014,7 @@ bot.on('text', async (ctx) => {
         fs.mkdirSync(sessionsPath, { recursive: true });
       }
 
-      const client = new Client({
-        authStrategy: new LocalAuth({
-          clientId: accountId,
-          dataPath: sessionsPath,
-        }),
-        puppeteer: {
-          headless: true,
-          executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--single-process',
-            '--disable-gpu',
-          ],
-          ignoreHTTPSErrors: true,
-        },
-      });
+      const client = createClient(accountId, '');
 
       waAccounts.set(accountId, {
         client,
@@ -1020,7 +1031,8 @@ bot.on('text', async (ctx) => {
         lastActivity: Date.now(),
         sleepCooldown: 0,
         messagesBeforePause: 100,
-        pauseDurationMinutes: 10
+        pauseDurationMinutes: 10,
+        proxy: ''
       } as any);
 
       let qrAttempts = 0;
@@ -1138,6 +1150,32 @@ bot.on('text', async (ctx) => {
         (acc as any).pauseDurationMinutes = pause;
         saveAccountsData();
         await safeReply(ctx, `Pause: ${limit} msg -> ${pause} min`);
+        await safeEdit(ctx, `${acc.name || acc.phone}`, { ...accountsMenu(accountId) });
+      }
+      userStates.delete(ctx.from!.id);
+      break;
+    }
+
+    case 'waiting_proxy': {
+      const accountId = state.accountId;
+      const acc = waAccounts.get(accountId!);
+      if (acc) {
+        const proxy = text.trim();
+        if (proxy) {
+          // Validate proxy format
+          if (proxy.startsWith('http://') || proxy.startsWith('https://') || proxy.startsWith('socks')) {
+            (acc as any).proxy = proxy;
+            saveAccountsData();
+            await safeReply(ctx, `Proxy set: ${proxy}`);
+          } else {
+            await safeReply(ctx, 'Invalid proxy format. Use: http://user:pass@host:port');
+            return;
+          }
+        } else {
+          (acc as any).proxy = '';
+          saveAccountsData();
+          await safeReply(ctx, 'Proxy removed');
+        }
         await safeEdit(ctx, `${acc.name || acc.phone}`, { ...accountsMenu(accountId) });
       }
       userStates.delete(ctx.from!.id);
