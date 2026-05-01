@@ -5,7 +5,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import express from 'express';
 import 'dotenv/config';
-import { ProxyAgent } from 'proxy-agent';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -63,7 +62,7 @@ function loadAccountsData(): { [id: string]: AccountData } {
   return {};
 }
 
-function createClient(accountId: string, proxy?: string): Client {
+function createClient(accountId: string): Client {
   const sessionsBasePath = process.env.WA_SESSIONS_PATH || '/data/wa-sessions';
   const sessionPath = `${sessionsBasePath}/${accountId}`;
 
@@ -102,12 +101,6 @@ function createClient(accountId: string, proxy?: string): Client {
     ignoreHTTPSErrors: true,
   };
 
-  if (proxy) {
-    const proxyAgent = new ProxyAgent(proxy);
-    puppeteerOptions.proxyAgent = proxyAgent;
-    console.log(`Using proxy for ${accountId}: ${proxy}`);
-  }
-
   return new Client({
     authStrategy: new LocalAuth({
       clientId: accountId,
@@ -131,7 +124,7 @@ async function restoreExistingAccounts(): Promise<void> {
 
     console.log(`Restoring account: ${accountId} (${accData.phone})`);
 
-    const client = createClient(accountId, accData.proxy);
+    const client = createClient(accountId);
 
     waAccounts.set(accountId, {
       client,
@@ -376,8 +369,7 @@ async function wakeupAccount(accountId: string): Promise<boolean> {
   console.log(`Waking up account ${accountId}...`);
 
   try {
-    const proxy = (acc as any).proxy || '';
-    const client = createClient(accountId, proxy);
+    const client = createClient(accountId);
 
     acc.client = client;
     acc.status = 'connecting';
@@ -879,8 +871,7 @@ bot.action('restart_all', async (ctx) => {
 
         if (!fs.existsSync(sessionsPath)) continue;
 
-        const proxy = (acc as any).proxy || '';
-        const client = createClient(id, proxy);
+        const client = createClient(id);
 
         acc.client = client;
         acc.status = 'connecting';
@@ -1014,7 +1005,7 @@ bot.on('text', async (ctx) => {
         fs.mkdirSync(sessionsPath, { recursive: true });
       }
 
-      const client = createClient(accountId, '');
+      const client = createClient(accountId);
 
       waAccounts.set(accountId, {
         client,
