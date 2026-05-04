@@ -227,6 +227,11 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/wakeup', (req, res) => {
+  console.log('Wakeup endpoint called');
+  res.json({ status: 'awake', timestamp: new Date().toISOString() });
+});
+
 app.get('/', (req, res) => {
   res.send('WhatsApp Bot Running');
 });
